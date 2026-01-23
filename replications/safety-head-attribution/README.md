@@ -19,7 +19,7 @@ This notebook demonstrates how to identify and ablate safety-critical attention 
 ### Prerequisites
 
 1. **NDIF API Key**: Get your free API key from https://login.ndif.us/
-2. **HuggingFace Account**: Accept the Llama 3.1 license at https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct
+2. **HuggingFace Account**: Accept the Llama 2 license at https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
 3. **HuggingFace Token**: Get your token from https://huggingface.co/settings/tokens
 
 ### Running the Notebook
@@ -31,11 +31,11 @@ This notebook demonstrates how to identify and ablate safety-critical attention 
 
 ### Quick Mode vs Full Mode
 
-Set `QUICK_MODE = True` in Cell 4 for fast testing (~15-30 min), or `False` for full analysis.
+Set `QUICK_MODE = True` in Cell 4 for fast testing, or `False` for full analysis.
 
 | Component | QUICK_MODE=True | QUICK_MODE=False |
 |-----------|-----------------|------------------|
-| SHIPS | ~64 heads (sampled) | All 5120 heads |
+| SHIPS | ~64 heads (sampled) | All 1024 heads |
 | Sahara | 2 queries, ~16 heads | 100 queries, all heads |
 | Evaluation | 5 queries, 32 tokens | 100 queries, 64 tokens |
 
@@ -43,10 +43,21 @@ Set `QUICK_MODE = True` in Cell 4 for fast testing (~15-30 min), or `False` for 
 
 - `demo.ipynb` - Main notebook with all three methods
 - `maliciousinstruct.csv` - Dataset of 100 harmful queries for evaluation
+- Additional datasets: `jailbreakbench.csv`, `advbench.csv`, `harmful_behaviors.csv`, etc.
+
+## Output Files
+
+After running the notebook, the following data files are saved:
+- `ships_data.pt` - SHIPS scores for all tested heads
+- `sahara_data.pt` - Sahara subspace shift scores
+- `eval_data.pt` - Evaluation results (baseline vs ablated)
+- `experiment_data.pt` - Compiled data from all experiments
+
+These files serve as proof of a complete experimental run and can be loaded for further analysis.
 
 ## Model
 
-This implementation uses **Llama-3.1-70B-Instruct** (80 layers x 64 heads = 5120 attention heads) instead of the original paper's Llama-2-7b-chat-hf, since Llama 2 is not available on NDIF.
+This implementation uses **Llama-2-7b-chat-hf** (32 layers x 32 heads = 1024 attention heads), the same model as the original paper.
 
 ## References
 
