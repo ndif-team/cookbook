@@ -1,0 +1,31 @@
+{
+  "model": {
+    "name": "meta-llama/Llama-2-7b-hf",
+    "num_layers": 32,
+    "hidden_dim": 4096,
+    "vocab_size": 32000
+  },
+  "experiments": {
+    "translation": {
+      "input_lang": "fr",
+      "target_lang": "zh",
+      "latent_lang": "en",
+      "n_examples": 5
+    },
+    "cloze": {
+      "target_lang": "fr",
+      "latent_lang": "en",
+      "n_examples": 2
+    }
+  },
+  "execution": {
+    "remote": true,
+    "seed": 42
+  },
+  "paper": {
+    "title": "Do Llamas Work in English? On the Latent Language of Multilingual Transformers",
+    "arxiv": "2402.10588",
+    "authors": ["Wendler", "Veselovsky", "Monea", "West"],
+    "year": 2024
+  }
+}
