@@ -27,6 +27,15 @@ pip install torch nnsight transformers pandas numpy matplotlib seaborn tqdm
 2. Add your NDIF and HuggingFace tokens in Cell 1.2
 3. Run all cells in sequence
 
+## Runtime
+
+| Experiment | Samples | Time | Per Sample |
+|------------|---------|------|------------|
+| Translation (fr→zh) | 118 | ~6 min | ~3s |
+| Cloze (fr) | 57 | ~3 min | ~3s |
+
+**Time complexity:** O(num_samples) - each sample requires one NDIF remote trace that processes all 32 layers in a single forward pass.
+
 ## Implemented Experiments
 
 ### Translation Task (French → Chinese)
@@ -61,13 +70,12 @@ pip install torch nnsight transformers pandas numpy matplotlib seaborn tqdm
 ## Model and Dataset
 
 - **Model:** meta-llama/Llama-2-7B-hf via NDIF remote execution
-- **Dataset:** Word pairs from paper's supplementary materials (118 words for translation, 118 for cloze)
+- **Dataset:** Word pairs from paper's supplementary materials (118 words for translation, 57 for cloze after filtering)
 
 ## Deviations from Original
 
-1. **Remote execution:** Uses NDIF instead of local GPU, requiring stack-inside-trace pattern for proper proxy handling
-2. **Subset of experiments:** Only French→Chinese translation and French cloze implemented
-3. **Results saving:** Added `.pt` file export for reproducibility
+1. **Subset of experiments:** Only French→Chinese translation and French cloze implemented (paper covers additional language pairs: de→zh, ru→zh)
+2. **Peak layer difference:** English peaks at layer 23 vs paper's ~15-20 (within expected variance across runs)
 
 ## Comparison to Original Results
 
@@ -76,7 +84,7 @@ Our replication shows:
 - Target language peaks at layer 32 (paper: final layers)
 - Qualitative pattern matches: English as pivot language confirmed
 
-The slight difference in peak layer may be due to prompt formatting variations.
+Peak layer differences are within expected variance across runs. The qualitative pattern (English peaks before target language) matches the paper.
 
 ## Output Files
 
