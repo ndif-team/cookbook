@@ -1,0 +1,13 @@
+# Downloaded original ARENA notebooks (for reference only)
+_originals/
+
+# Backup files from merge tool
+*.ipynb.bak
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
