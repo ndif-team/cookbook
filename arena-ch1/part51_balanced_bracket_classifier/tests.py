@@ -9,7 +9,7 @@ from typing import Callable
 
 import einops
 import torch as t
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Float
 from nnterp import StandardizedTransformer
 from torch import Tensor
 
@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from brackets_datasets import BracketsDataset, SimpleTokenizer
 
-device = t.device("cuda" if t.cuda.is_available() else "cpu")
+device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")
 t.set_grad_enabled(False)
 
 MAIN = __name__ == "__main__"

@@ -7,7 +7,7 @@ import torch as t
 import numpy as np
 import einops
 
-device = t.device("cuda" if t.cuda.is_available() else "cpu")
+device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")
 p = 113
 
 

@@ -18,7 +18,6 @@ from factored_matrix import FactoredMatrix
 # Ensure parent dirs are importable
 arena_ch1_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(arena_ch1_dir))
-sys.path.insert(0, str(arena_ch1_dir / "_conversion"))
 
 
 def test_get_log_probs(get_log_probs: Callable):

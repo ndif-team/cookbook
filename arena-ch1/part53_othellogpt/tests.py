@@ -1,13 +1,8 @@
-import sys
-from pathlib import Path
-
 import einops
 import torch as t
-from jaxtyping import Float
 from torch import Tensor
 from typing import Callable
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_conversion"))
 from convert_othello_model import OthelloGPT
 
 

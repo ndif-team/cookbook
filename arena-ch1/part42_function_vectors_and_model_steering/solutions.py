@@ -22,9 +22,7 @@ from torch import Tensor
 logging.disable(sys.maxsize)
 
 t.set_grad_enabled(False)
-device = t.device(
-    "mps" if t.backends.mps.is_available() else "cuda" if t.cuda.is_available() else "cpu"
-)
+device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")
 
 # Make sure exercises are in the path
 section_dir = Path(__file__).parent

@@ -2,7 +2,6 @@
 
 import re
 import sys
-from functools import partial
 from itertools import product
 from pathlib import Path
 from typing import Callable, Literal
@@ -21,9 +20,7 @@ from tqdm.auto import tqdm
 from nnterp import StandardizedTransformer
 
 t.set_grad_enabled(False)
-device = t.device(
-    "mps" if t.backends.mps.is_available() else "cuda" if t.cuda.is_available() else "cpu"
-)
+device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")
 
 # Make sure exercises are in the path
 section_dir = Path(__file__).parent

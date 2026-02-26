@@ -18,10 +18,9 @@ from torch import Tensor
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-# Add parent dir for plotly_utils and _conversion
+# Add parent dir for plotly_utils
 arena_ch1_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(arena_ch1_dir))
-sys.path.insert(0, str(arena_ch1_dir / "_conversion"))
 
 from convert_2L_attn_only import load_model
 from factored_matrix import FactoredMatrix
@@ -36,7 +35,8 @@ from plotly_utils import (
 
 import part2_intro_to_mech_interp.tests as tests
 
-device = t.device("cuda" if t.cuda.is_available() else "cpu")
+t.set_grad_enabled(False)
+device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")
 
 MAIN = __name__ == "__main__"
 

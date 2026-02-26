@@ -14,14 +14,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 import torch as t
 import torch.nn.functional as F
-from IPython.display import display
-
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from plotly_utils import to_numpy
 
-device = t.device("cuda" if t.cuda.is_available() else "cpu")
+device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")
 
 p = 113
 

@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import plotly_utils
 from plotly_utils import bar, hist, to_numpy
 
-device = t.device("cuda" if t.cuda.is_available() else "cpu")
+device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")
 t.set_grad_enabled(False)
 
 MAIN = __name__ == "__main__"

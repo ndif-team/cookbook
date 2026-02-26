@@ -1,10 +1,8 @@
 # %%
 
 import copy
-import os
 import sys
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -19,18 +17,15 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from tqdm import tqdm
 
-# Add parent directory for plotly_utils, and conversion directory for OthelloGPT model
+# Add parent directory for plotly_utils
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_conversion"))
 
 from plotly_utils import to_numpy
 import part53_othellogpt.utils as utils
 import part53_othellogpt.tests as tests
 from convert_othello_model import OthelloGPT, load_model
 
-device = t.device(
-    "mps" if t.backends.mps.is_available() else "cuda" if t.cuda.is_available() else "cpu"
-)
+device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")
 
 t.set_grad_enabled(False)
 

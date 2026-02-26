@@ -12,32 +12,35 @@ This is an adaptation of [ARENA 3.0](https://arena.education) Chapter 1 (Transfo
 | Section | Directory | Description |
 |---|---|---|
 | 1.2 | `part2_intro_to_mech_interp/` | Introduction to mechanistic interpretability. NNsight fundamentals, GPT-2 induction heads, attention patterns, and direct logit attribution using raw NNsight. Concludes with an nnterp introduction. |
-| 1.3.1 | `part31_superposition_and_saes/` | Toy models of superposition. Feature geometry, superposition theory, and toy model training with plain PyTorch and minimal NNsight. |
-| 1.3.2 | `part32_interp_with_saes/` | Interpretability with sparse autoencoders. SAE feature analysis on language models using nnterp. |
 | 1.4.1 | `part41_indirect_object_identification/` | Indirect Object Identification circuit in GPT-2. Activation patching, path patching, and circuit discovery using nnterp. |
 | 1.4.2 | `part42_function_vectors_and_model_steering/` | Function vectors and model steering. Computing function vectors from in-context learning examples and steering GPT-2 behavior using nnterp. |
 | 1.5.1 | `part51_balanced_bracket_classifier/` | Balanced bracket classifier. Interpretability on a custom-trained bracket classification transformer using raw NNsight. |
 | 1.5.2 | `part52_grokking_and_modular_arithmetic/` | Grokking and modular arithmetic. Fourier analysis of learned representations and progress measures using raw NNsight. |
 | 1.5.3 | `part53_othellogpt/` | OthelloGPT. Probing for board state representations in a model trained on Othello games using raw NNsight. |
 
+### Omitted: Sections 1.3.1 & 1.3.2 (Superposition & SAEs)
+
+The SAE sections from the original ARENA course are not included in this port. The exercises are deeply intertwined with the TransformerLens ecosystem — they teach [Neuronpedia](https://www.neuronpedia.org/), which is built on [SAELens](https://github.com/jbloom/SAELens), which in turn depends on TransformerLens. Porting these exercises would require replacing the entire toolchain rather than swapping out a single library, putting them out of scope for now.
+
+We plan to host demonstrations of attribution patching, sparse feature circuits, circuit tracing and attribution graphs with NNsight in a separate context.
+
 ---
 
 ## Setup
 
-The notebooks are designed for Google Colab (free tier, T4 GPU). Each notebook includes its own setup cell, but the core dependencies are:
+### Local installation
 
 ```bash
-# NNsight (pinned version)
-pip install git+https://github.com/ndif-team/nnsight.git@v0.5.16
-
-# nnterp (installed with --no-deps due to unreleased nnsight version requirement)
-pip install --no-deps nnterp
-
-# Visualization and utility packages
-pip install circuitsvis plotly ipywidgets jaxtyping einops
+pip install -r requirements.txt
 ```
 
-`torch` and `transformers` are pre-installed on Colab and should not be upgraded.
+This installs `nnsight>=0.6`, `nnterp>=1.2.2`, and all visualization/utility packages. See `requirements.txt` for the full list.
+
+> **Do not install `sae-lens` or `transformer_lens`** in the same environment — they require `transformers<5` which conflicts with `nnsight>=0.6`.
+
+### Google Colab
+
+The notebooks also run on Google Colab (free tier, T4 GPU). Each notebook includes its own setup cell that installs the required packages.
 
 ---
 

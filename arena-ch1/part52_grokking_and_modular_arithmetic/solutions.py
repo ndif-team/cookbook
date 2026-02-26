@@ -1,6 +1,5 @@
 # %%
 
-import os
 import sys
 from functools import partial
 from pathlib import Path
@@ -18,7 +17,6 @@ from nnterp.rename_utils import RenameConfig, AttnProbFunction
 # Setup paths
 section_dir = Path(__file__).resolve().parent
 conversion_dir = section_dir.parent / "_conversion"
-sys.path.insert(0, str(conversion_dir))
 sys.path.insert(0, str(section_dir))
 sys.path.insert(0, str(section_dir.parent))
 
@@ -27,7 +25,7 @@ from plotly_utils import to_numpy
 import part52_grokking_and_modular_arithmetic.utils as utils
 import part52_grokking_and_modular_arithmetic.tests as tests
 
-device = t.device("cuda" if t.cuda.is_available() else "cpu")
+device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")
 
 t.set_grad_enabled(False)
 
