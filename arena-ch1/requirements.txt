@@ -2,9 +2,6 @@
 nnsight>=0.6
 nnterp>=1.2.2
 
-# PyTorch (install separately for your platform, see https://pytorch.org)
-torch>=2.0
-
 # HuggingFace
 transformers>=4.40
 huggingface-hub
@@ -13,7 +10,7 @@ safetensors
 # Tensor utilities
 einops
 jaxtyping
-eindex
+eindex-callum
 
 # Visualization
 plotly

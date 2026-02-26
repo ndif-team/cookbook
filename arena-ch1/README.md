@@ -31,6 +31,10 @@ We plan to host demonstrations of attribution patching, sparse feature circuits,
 ### Local installation
 
 ```bash
+git clone https://github.com/ndif-team/cookbook.git
+cd cookbook
+git checkout arena
+cd arena-ch1
 pip install -r requirements.txt
 ```
 
