@@ -13,6 +13,8 @@ import torch as t
 from jaxtyping import Float
 from torch import Tensor
 
+from factored_matrix import FactoredMatrix
+
 # Ensure parent dirs are importable
 arena_ch1_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(arena_ch1_dir))
@@ -80,7 +82,7 @@ def test_get_ablation_scores(
 
 
 def test_full_OV_circuit(
-    full_OV_circuit: Tensor, model, layer: int, head: int
+    full_OV_circuit: FactoredMatrix, model, layer: int, head: int
 ):
     """Test the full OV circuit computation."""
     raw = model._model
@@ -89,11 +91,11 @@ def test_full_OV_circuit(
     W_O = raw.blocks[layer].attn.W_O[head]
     W_U = raw.unembed.weight.T
 
-    OV = W_V @ W_O
-    expected = W_E @ OV @ W_U
+    OV = FactoredMatrix(W_V, W_O)
+    expected = (W_E @ OV) @ W_U
 
     t.testing.assert_close(
-        full_OV_circuit[:20, :20], expected[:20, :20], atol=1e-4, rtol=1e-4
+        full_OV_circuit.get_corner(20), expected.get_corner(20), atol=1e-4, rtol=1e-4
     )
 
     print("All tests in `test_full_OV_circuit` passed!")
@@ -117,12 +119,14 @@ def test_find_K_comp_full_circuit(find_K_comp_full_circuit: Callable, model):
     """Test K-composition full circuit."""
     import part2_intro_to_mech_interp.solutions as solutions
 
-    Q, K_T = find_K_comp_full_circuit(model, 7, 4)
-    Q_exp, K_T_exp = solutions.find_K_comp_full_circuit(model, 7, 4)
+    K_comp_circuit = find_K_comp_full_circuit(model, 7, 4)
+    K_comp_circuit_expected = solutions.find_K_comp_full_circuit(model, 7, 4)
 
-    # Compare Q and K_T directly (avoid OOM from d_vocab x d_vocab matmul)
-    t.testing.assert_close(Q[:20], Q_exp[:20], atol=1e-4, rtol=1e-4)
-    t.testing.assert_close(K_T[:, :20], K_T_exp[:, :20], atol=1e-4, rtol=1e-4)
+    assert isinstance(K_comp_circuit, FactoredMatrix), "Should return a FactoredMatrix object!"
+    t.testing.assert_close(
+        K_comp_circuit.get_corner(20), K_comp_circuit_expected.get_corner(20),
+        atol=1e-4, rtol=1e-4,
+    )
 
     print("All tests in `test_find_K_comp_full_circuit` passed!")
 

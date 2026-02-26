@@ -1,10 +1,7 @@
 # %%
 
-import functools
-import math
 import sys
 from pathlib import Path
-from typing import Callable
 
 import circuitsvis as cv
 import einops
@@ -15,7 +12,6 @@ import torch.nn.functional as F
 from eindex import eindex
 from IPython.display import display
 from jaxtyping import Float, Int
-from nnsight import LanguageModel, NNsight
 from nnterp import StandardizedTransformer
 from nnterp.rename_utils import RenameConfig, AttnProbFunction
 from torch import Tensor
@@ -27,7 +23,8 @@ arena_ch1_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(arena_ch1_dir))
 sys.path.insert(0, str(arena_ch1_dir / "_conversion"))
 
-from convert_2L_attn_only import AttnOnly2L, load_model
+from convert_2L_attn_only import load_model
+from factored_matrix import FactoredMatrix
 from plotly_utils import (
     hist,
     imshow,
@@ -36,6 +33,8 @@ from plotly_utils import (
     plot_loss_difference,
     to_numpy,
 )
+
+import part2_intro_to_mech_interp.tests as tests
 
 device = t.device("cuda" if t.cuda.is_available() else "cpu")
 
@@ -358,6 +357,8 @@ if MAIN:
     rep_str = [tokenizer_2l.decode(t_) for t_ in rep_tokens.squeeze()]
     log_probs = get_log_probs(rep_logits, rep_tokens).squeeze()
 
+    tests.test_get_log_probs(get_log_probs)
+
     print(f"Performance on the first half: {log_probs[:seq_len].mean():.3f}")
     print(f"Performance on the second half: {log_probs[seq_len:].mean():.3f}")
 
@@ -591,6 +592,8 @@ if MAIN:
         t.testing.assert_close(logit_attr.sum(1), correct_token_logits, atol=1e-3, rtol=0)
         print("Tests passed!")
 
+    tests.test_logit_attribution(logit_attribution, model, tokens)
+
 # %%
 
 if MAIN:
@@ -686,6 +689,8 @@ if MAIN:
     rep_tokens_1 = generate_repeated_tokens(model, seq_len=50, batch_size=1)
     ablation_scores = get_ablation_scores(model, rep_tokens_1)
 
+    tests.test_get_ablation_scores(ablation_scores, model, rep_tokens_1)
+
 # %%
 
 if MAIN:
@@ -730,16 +735,18 @@ if MAIN:
     W_E = model._model.embed.weight  # [d_vocab, d_model]
     W_U = model._model.unembed.weight.T  # [d_model, d_vocab]
 
-    # OV circuit: W_V @ W_O → [d_model, d_model]
-    OV_circuit = W_V @ W_O  # [d_model, d_model]
-    # Full circuit: W_E @ OV @ W_U → [d_vocab, d_vocab]
-    full_OV_circuit = W_E @ OV_circuit @ W_U  # [d_vocab, d_vocab]
+    # OV circuit: FactoredMatrix(W_V, W_O) — avoids materializing d_vocab x d_vocab
+    OV_circuit = FactoredMatrix(W_V, W_O)
+    # Full circuit: W_E @ OV @ W_U → FactoredMatrix, never materializes d_vocab x d_vocab
+    full_OV_circuit = W_E @ OV_circuit @ W_U
+
+    tests.test_full_OV_circuit(full_OV_circuit, model, layer, head_index)
 
 # %%
 
 if MAIN:
     indices = t.randint(0, model._model.d_vocab, (200,))
-    full_OV_circuit_sample = full_OV_circuit[indices][:, indices]
+    full_OV_circuit_sample = full_OV_circuit[indices][:, indices].AB
 
     imshow(
         to_numpy(full_OV_circuit_sample),
@@ -752,14 +759,14 @@ if MAIN:
 # %%
 
 
-def top_1_acc(full_OV_circuit: Tensor, batch_size: int = 1000) -> float:
+def top_1_acc(full_OV_circuit: FactoredMatrix, batch_size: int = 1000) -> float:
     """
     Return the fraction of the time that the maximum value is on the circuit diagonal.
     """
     total = 0
 
     for indices in t.split(t.arange(full_OV_circuit.shape[0], device=device), batch_size):
-        AB_slice = full_OV_circuit[indices]
+        AB_slice = full_OV_circuit[indices].AB
         total += (t.argmax(AB_slice, dim=1) == indices).float().sum().item()
 
     return total / full_OV_circuit.shape[0]
@@ -782,7 +789,7 @@ if MAIN:
     W_V_both = t.cat([W_V_4, W_V_10], dim=-1)  # [d_model, 2*d_head]
     W_O_both = t.cat([W_O_4, W_O_10], dim=0)  # [2*d_head, d_model]
 
-    W_OV_eff = W_E @ (W_V_both @ W_O_both) @ W_U
+    W_OV_eff = W_E @ FactoredMatrix(W_V_both, W_O_both) @ W_U
 
     print(
         f"Fraction of the time that the best logit is on the diagonal: {top_1_acc(W_OV_eff):.4f}"
@@ -933,6 +940,8 @@ def decompose_attn_scores(
 if MAIN:
     decomposed_scores = decompose_attn_scores(decomposed_q, decomposed_k, model)
 
+    tests.test_decompose_attn_scores(decompose_attn_scores, decomposed_q, decomposed_k, model)
+
     q_label = "Embed"
     k_label = "0.7"
     decomposed_scores_from_pair = decomposed_scores[
@@ -968,12 +977,10 @@ if MAIN:
 
 def find_K_comp_full_circuit(
     model: StandardizedTransformer, prev_token_head_index: int, ind_head_index: int
-) -> tuple[Tensor, Tensor]:
+) -> FactoredMatrix:
     """
-    Returns (Q_factor, K_factor) tensors that when multiplied give the full K-composition circuit.
-    Q_factor: [d_vocab, d_head]
-    K_factor: [d_head, d_vocab]
-    The full circuit is Q_factor @ K_factor = [d_vocab, d_vocab]
+    Returns a FactoredMatrix representing the full K-composition circuit.
+    The circuit is Q @ K.T = [d_vocab, d_vocab], kept in factored form.
     """
     raw = model._model
     W_E = raw.embed.weight  # [d_vocab, d_model]
@@ -984,20 +991,21 @@ def find_K_comp_full_circuit(
 
     Q = W_E @ W_Q  # [d_vocab, d_head]
     K = W_E @ W_V @ W_O @ W_K  # [d_vocab, d_head]
-    return Q, K.T  # Q: [d_vocab, d_head], K.T: [d_head, d_vocab]
+    return FactoredMatrix(Q, K.T)  # [d_vocab, d_vocab] in factored form
 
 
 if MAIN:
     prev_token_head_index = 7
     ind_head_index = 4
-    Q_factor, K_factor = find_K_comp_full_circuit(
+    K_comp_circuit = find_K_comp_full_circuit(
         model, prev_token_head_index, ind_head_index
     )
-    K_comp_circuit = Q_factor @ K_factor  # [d_vocab, d_vocab]
 
     print(
         f"Token frac where max-activating key = same token: {top_1_acc(K_comp_circuit.T):.4f}"
     )
+
+    tests.test_find_K_comp_full_circuit(find_K_comp_full_circuit, model)
 
 # %%
 
@@ -1020,6 +1028,8 @@ def get_comp_score(
 
 
 if MAIN:
+    tests.test_get_comp_score(get_comp_score)
+
     # Get all QK and OV matrices for the 2L model
     # W_QK[layer, head] = W_Q @ W_K^T: [d_model, d_model]
     # W_OV[layer, head] = W_V @ W_O: [d_model, d_model]
@@ -1105,45 +1115,38 @@ if MAIN:
 
 
 def get_batched_comp_scores(
-    W_As: Tensor, W_Bs: Tensor
+    W_As: FactoredMatrix, W_Bs: FactoredMatrix
 ) -> Tensor:
     """
-    Computes compositional scores between pairs of matrices.
+    Computes compositional scores between pairs of matrices using FactoredMatrix.
 
-    W_As: [n_A, in, mid]
-    W_Bs: [n_B, mid, out]
+    W_As: FactoredMatrix with shape [n_A, d_model, d_model]
+    W_Bs: FactoredMatrix with shape [n_B, d_model, d_model]
 
     Returns: [n_A, n_B] composition scores
     """
-    # Compute norms
-    W_As_norm = W_As.pow(2).sum(dim=(-2, -1)).sqrt()  # [n_A]
-    W_Bs_norm = W_Bs.pow(2).sum(dim=(-2, -1)).sqrt()  # [n_B]
-
-    # Compute products: W_ABs[a, b] = W_As[a] @ W_Bs[b]
-    W_ABs = t.einsum("aij,bjk->abik", W_As, W_Bs)
-    W_ABs_norm = W_ABs.pow(2).sum(dim=(-2, -1)).sqrt()  # [n_A, n_B]
-
-    return W_ABs_norm / (W_As_norm[:, None] * W_Bs_norm[None, :])
+    W_As = FactoredMatrix(
+        W_As.A.reshape(-1, 1, *W_As.A.shape[-2:]),
+        W_As.B.reshape(-1, 1, *W_As.B.shape[-2:]),
+    )
+    W_Bs = FactoredMatrix(
+        W_Bs.A.reshape(1, -1, *W_Bs.A.shape[-2:]),
+        W_Bs.B.reshape(1, -1, *W_Bs.B.shape[-2:]),
+    )
+    W_ABs = W_As @ W_Bs
+    return W_ABs.norm() / (W_As.norm() * W_Bs.norm())
 
 
 if MAIN:
     raw = model._model
-    # Build W_OV and W_QK as batched tensors
-    W_OV_0 = t.stack(
-        [raw.blocks[0].attn.W_V[h] @ raw.blocks[0].attn.W_O[h] for h in range(n_heads)]
-    )  # [n_heads, d_model, d_model]
-    W_QK_1 = t.stack(
-        [raw.blocks[1].attn.W_Q[h] @ raw.blocks[1].attn.W_K[h].T for h in range(n_heads)]
-    )  # [n_heads, d_model, d_model]
-    W_OV_1 = t.stack(
-        [raw.blocks[1].attn.W_V[h] @ raw.blocks[1].attn.W_O[h] for h in range(n_heads)]
-    )
+    # Build W_OV and W_QK as FactoredMatrix objects
+    W_OV_0 = FactoredMatrix(raw.blocks[0].attn.W_V, raw.blocks[0].attn.W_O)
+    W_QK_1 = FactoredMatrix(raw.blocks[1].attn.W_Q, raw.blocks[1].attn.W_K.transpose(-1, -2))
+    W_OV_1 = FactoredMatrix(raw.blocks[1].attn.W_V, raw.blocks[1].attn.W_O)
 
     composition_scores_batched = dict()
     composition_scores_batched["Q"] = get_batched_comp_scores(W_OV_0, W_QK_1)
-    composition_scores_batched["K"] = get_batched_comp_scores(
-        W_OV_0, W_QK_1.transpose(-2, -1)
-    )
+    composition_scores_batched["K"] = get_batched_comp_scores(W_OV_0, W_QK_1.T)
     composition_scores_batched["V"] = get_batched_comp_scores(W_OV_0, W_OV_1)
 
     t.testing.assert_close(composition_scores_batched["Q"], composition_scores["Q"])
