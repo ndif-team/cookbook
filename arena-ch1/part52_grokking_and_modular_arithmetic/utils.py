@@ -83,8 +83,8 @@ def unflatten_first(tensor):
 
 
 def cross_entropy_high_precision(logits, labels):
-    logprobs = F.log_softmax(logits.to(t.float64), dim=-1)
-    prediction_logprobs = t.gather(logprobs, index=labels[:, None], dim=-1)
+    logprobs = F.log_softmax(logits.cpu().to(t.float64), dim=-1)
+    prediction_logprobs = t.gather(logprobs, index=labels.cpu()[:, None], dim=-1)
     loss = -t.mean(prediction_logprobs)
     return loss
 
