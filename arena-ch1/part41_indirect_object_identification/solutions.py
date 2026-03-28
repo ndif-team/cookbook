@@ -1790,13 +1790,13 @@ if MAIN:
     for (row, col), desc, dataset in datasets:
         # Get clean z values from the modified dataset
         modified_z_cache = {}
-        for layer in set(l for l, h in s2_inhibition_heads):
+        for layer in sorted(set(l for l, h in s2_inhibition_heads)):
             with model.trace(dataset.toks):
                 modified_z_cache[layer] = model.layers[layer].self_attn.c_proj.input.save()
 
         # Run on IOI dataset, patching S-inhibition heads from modified dataset
         with model.trace(ioi_dataset.toks):
-            for layer in set(l for l, h in s2_inhibition_heads):
+            for layer in sorted(set(l for l, h in s2_inhibition_heads)):
                 z = model.layers[layer].self_attn.c_proj.input
                 z_heads = z.reshape(z.shape[0], z.shape[1], N_HEADS, D_HEAD)
                 mod_z_heads = modified_z_cache[layer].reshape(z.shape[0], z.shape[1], N_HEADS, D_HEAD)

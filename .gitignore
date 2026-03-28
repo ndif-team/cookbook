@@ -19,6 +19,9 @@ venv/
 .env
 .env.*
 
+# Scratch/testing
+_scratch/
+
 # Project-specific ignores
 arena-ch1/CHANGELOG.md
 arena-ch1/NNTERP_COMPAT_REPORT.md
