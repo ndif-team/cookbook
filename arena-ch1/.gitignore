@@ -11,3 +11,6 @@ __pycache__/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Converted model weights (auto-downloaded on first run)
+_conversion/

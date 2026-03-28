@@ -260,32 +260,59 @@ class OthelloGPT(nn.Module):
 # Convenience: load model from saved state_dict
 # ============================================================
 
+def convert_from_hf(save_path: str | None = None) -> dict:
+    """Download the TransformerLens checkpoint from HuggingFace and convert to our format.
+
+    Downloads from NeelNanda/Othello-GPT-Transformer-Lens and remaps weight keys
+    to match OthelloGPT's nn.Module structure.
+    """
+    from huggingface_hub import hf_hub_download
+
+    tl_path = hf_hub_download(
+        repo_id="NeelNanda/Othello-GPT-Transformer-Lens",
+        filename="synthetic_model.pth",
+    )
+    tl_sd = torch.load(tl_path, map_location="cpu", weights_only=True)
+
+    new_sd = {}
+    for k, v in tl_sd.items():
+        if k == "embed.W_E":
+            new_sd["embed.weight"] = v
+        elif k == "pos_embed.W_pos":
+            new_sd["pos_embed.weight"] = v
+        elif k == "unembed.W_U":
+            new_sd["unembed.weight"] = v.T  # nn.Linear stores [out, in]
+        elif k == "unembed.b_U":
+            new_sd["unembed.bias"] = v
+        elif k.endswith(".mask") or k.endswith(".IGNORE"):
+            continue  # buffers created by model init
+        else:
+            new_sd[k] = v
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save(new_sd, save_path)
+
+    return new_sd
+
+
 def load_model(
     state_dict_path: str | None = None,
     device: str = "cpu",
 ) -> OthelloGPT:
     """Load the converted model from a saved state dict.
 
-    If state_dict_path is None or the file doesn't exist, tries to download
-    from HuggingFace Hub (woog/arena-othello-checkpoints).
-    Falls back to looking in the _conversion directory next to this file.
+    If state_dict_path is None or the file doesn't exist, automatically
+    downloads from NeelNanda/Othello-GPT-Transformer-Lens and converts.
     """
     if state_dict_path is None:
         state_dict_path = str(Path(__file__).resolve().parent / "othello_gpt_converted.pt")
-    if not os.path.exists(state_dict_path):
-        try:
-            from huggingface_hub import hf_hub_download
-            state_dict_path = hf_hub_download(
-                repo_id="woog/arena-othello-checkpoints",
-                filename="othello_gpt_converted.pt",
-            )
-        except Exception:
-            raise FileNotFoundError(
-                f"Converted model not found at {state_dict_path}. "
-                "Run the conversion script first or upload to HuggingFace."
-            )
+    if os.path.exists(state_dict_path):
+        sd = torch.load(state_dict_path, map_location=device, weights_only=True)
+    else:
+        print(f"Converted model not found at {state_dict_path}, downloading and converting...")
+        sd = convert_from_hf(save_path=state_dict_path)
     model = OthelloGPT()
-    sd = torch.load(state_dict_path, map_location=device, weights_only=True)
     model.load_state_dict(sd)
     model.to(device)
     model.eval()
