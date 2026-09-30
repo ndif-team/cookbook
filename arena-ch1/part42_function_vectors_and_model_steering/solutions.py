@@ -13,7 +13,9 @@ import numpy as np
 import torch as t
 from IPython.display import display
 from jaxtyping import Float
-from nnterp import StandardizedTransformer
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from nnterp_compat import StandardizedTransformer
+from nnsight import save
 from rich import print as rprint
 from rich.table import Table
 from torch import Tensor
@@ -718,7 +720,7 @@ def calculate_fn_vectors_and_intervene(
             ].save()
 
         # For each head, run a forward pass on corrupted prompts with intervention
-        correct_logprobs_dict = {}
+        correct_logprobs_dict = save({})
         for layer in layers:
             for head in heads:
                 with tracer.invoke(corrupted_dataset.prompts):
@@ -1142,7 +1144,7 @@ if MAIN:
 
 if MAIN:
     # Code to calculate decoded vocabulary:
-    logits = model._model.lm_head(fn_vector.float().to(device))
+    logits = model._model.lm_head(fn_vector.to(model._model.lm_head.weight))
     max_logits = logits.topk(20).indices.tolist()
     tokens = model.tokenizer.batch_decode(max_logits)
     print("Top logits:\n" + "\n".join(map(repr, tokens)))

@@ -11,7 +11,8 @@ import torch.nn.functional as F
 from jaxtyping import Float
 from torch import Tensor
 from tqdm import tqdm
-from nnterp import StandardizedTransformer
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from nnterp_compat import StandardizedTransformer
 from nnterp.rename_utils import RenameConfig, AttnProbFunction
 
 # Setup paths
@@ -203,7 +204,12 @@ if MAIN:
     assert neuron_acts_post.shape == (p * p, d_mlp)
     assert neuron_acts_pre.shape == (p * p, d_mlp)
 
-    print("All cache activation shape tests passed!")
+    cache = {
+        ("pattern", 0): attn_pattern,
+        ("post", 0): neuron_acts_post_full,
+        ("pre", 0): neuron_acts_pre_full,
+    }
+    tests.test_cache_activations(attn_mat, neuron_acts_post, neuron_acts_pre, cache)
 
 # %%
 
@@ -221,7 +227,7 @@ if MAIN:
     assert W_neur.shape == (n_heads, d_vocab - 1, d_mlp)
     assert W_attn.shape == (n_heads, d_vocab - 1)
 
-    print("All effective weight shape tests passed!")
+    tests.test_effective_weights(W_logit, W_neur, W_attn, model)
 
 # %%
 

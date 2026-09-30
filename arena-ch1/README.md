@@ -38,9 +38,9 @@ cd arena-ch1
 pip install -r requirements.txt
 ```
 
-This installs `nnsight>=0.6`, `nnterp>=1.2.2`, and all visualization/utility packages. See `requirements.txt` for the full list.
+This installs `nnsight==0.8.0rc1`, `nnterp>=1.2.2`, and all visualization/utility packages. See `requirements.txt` for the full list. The course imports `StandardizedTransformer` through `nnterp_compat.py`, a small adapter for the NNsight 0.8 API changes.
 
-> **Do not install `sae-lens` or `transformer_lens`** in the same environment — they require `transformers<5` which conflicts with `nnsight>=0.6`.
+> **Do not install `sae-lens` or `transformer_lens`** in the same environment — they require `transformers<5` which conflicts with `nnsight==0.8.0rc1`.
 
 ### Google Colab
 

@@ -17,7 +17,8 @@ from rich import print as rprint
 from rich.table import Column, Table
 from torch import Tensor
 from tqdm.auto import tqdm
-from nnterp import StandardizedTransformer
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from nnterp_compat import StandardizedTransformer
 
 t.set_grad_enabled(False)
 device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.is_available() else "cpu")

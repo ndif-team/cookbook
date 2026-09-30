@@ -1,9 +1,10 @@
 # Core interpretability stack
-nnsight>=0.6
+nnsight==0.8.0rc1
 nnterp>=1.2.2
 
 # HuggingFace
 transformers>=4.40
+accelerate
 huggingface-hub
 safetensors
 

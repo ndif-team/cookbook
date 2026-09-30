@@ -17,7 +17,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from IPython.display import display
 from jaxtyping import Bool, Float, Int
-from nnterp import StandardizedTransformer
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from nnterp_compat import StandardizedTransformer
 from nnterp.rename_utils import RenameConfig, AttnProbFunction
 from sklearn.linear_model import LinearRegression
 from torch import Tensor

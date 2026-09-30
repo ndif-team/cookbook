@@ -1,9 +1,11 @@
 import string
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch as t
-from nnterp import StandardizedTransformer
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from nnterp_compat import StandardizedTransformer
 
 N_LAYERS = 48
 N_HEADS = 25

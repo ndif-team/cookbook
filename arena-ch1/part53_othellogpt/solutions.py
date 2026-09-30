@@ -11,7 +11,8 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import torch as t
-from nnterp import StandardizedTransformer
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from nnterp_compat import StandardizedTransformer
 from nnterp.rename_utils import RenameConfig, AttnProbFunction
 from jaxtyping import Bool, Float, Int
 from torch import Tensor

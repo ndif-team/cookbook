@@ -12,7 +12,8 @@ import torch.nn.functional as F
 from eindex import eindex
 from IPython.display import display
 from jaxtyping import Float, Int
-from nnterp import StandardizedTransformer
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from nnterp_compat import StandardizedTransformer
 from nnterp.rename_utils import RenameConfig, AttnProbFunction
 from torch import Tensor
 from tqdm import tqdm

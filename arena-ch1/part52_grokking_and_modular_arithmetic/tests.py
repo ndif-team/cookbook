@@ -11,6 +11,45 @@ device = t.device("cuda" if t.cuda.is_available() else "mps" if t.backends.mps.i
 p = 113
 
 
+def test_cache_activations(attn_mat, neuron_acts_post, neuron_acts_pre, cache):
+    attn_mat_expected = cache["pattern", 0][:, :, 2]
+    neuron_acts_post_expected = cache["post", 0][:, -1]
+    neuron_acts_pre_expected = cache["pre", 0][:, -1]
+
+    t.testing.assert_close(attn_mat_expected, attn_mat)
+    t.testing.assert_close(neuron_acts_post_expected, neuron_acts_post)
+    t.testing.assert_close(neuron_acts_pre_expected, neuron_acts_pre)
+
+    print("All tests from `test_cache_activations` passed!")
+
+
+def test_effective_weights(W_logit, W_neur, W_attn, model):
+    W_O = model.blocks[0].attn.W_O
+    W_K = model.blocks[0].attn.W_K
+    W_Q = model.blocks[0].attn.W_Q
+    W_V = model.blocks[0].attn.W_V
+    W_in = model.blocks[0].mlp.W_in
+    W_out = model.blocks[0].mlp.W_out
+    W_pos = model.pos_embed.weight
+    W_E = model.embed.weight[:-1]
+    final_pos_resid_initial = model.embed.weight[-1] + W_pos[2]
+    W_U = model.unembed.weight.T[:, :-1]
+
+    W_logit_expected = W_out @ W_U
+
+    W_OV = W_V @ W_O
+    W_neur_expected = W_E @ W_OV @ W_in
+
+    W_QK = W_Q @ W_K.transpose(-1, -2)
+    W_attn_expected = final_pos_resid_initial @ W_QK @ W_E.T / (model.d_head**0.5)
+
+    t.testing.assert_close(W_logit_expected, W_logit)
+    t.testing.assert_close(W_neur_expected, W_neur)
+    t.testing.assert_close(W_attn_expected, W_attn)
+
+    print("All tests from `test_effective_weights` passed!")
+
+
 def test_make_fourier_basis(make_fourier_basis):
     fourier_basis, fourier_names = make_fourier_basis(p)
 

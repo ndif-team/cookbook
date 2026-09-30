@@ -10,7 +10,8 @@ from typing import Callable
 import einops
 import torch as t
 from jaxtyping import Float
-from nnterp import StandardizedTransformer
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from nnterp_compat import StandardizedTransformer
 from torch import Tensor
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
