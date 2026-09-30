@@ -1,3795 +1,2433 @@
-# NNsight: Design and Implementation
+# NNsight: Design and Implementation (0.8)
 
 *Jaden Fiotto-Kaufman*
 
----
+Adapted from the [official 0.8 implementation manual](https://github.com/ndif-team/nnsight/blob/main/NNsight.md), under the [MIT license](https://github.com/ndif-team/nnsight/blob/main/LICENSE). Verified against **nnsight 0.8.0rc1** and **transformers 5.x**. As of September 29, 2026, 0.8 is a prerelease: install `nnsight==0.8.0rc1` (or `pip install --pre nnsight`). NDIF still runs 0.7; the remote examples below default to `REMOTE = "local"` to test serialization offline. Use `REMOTE = True` only with a compatible NDIF deployment.
 
-## Goal of This Document
+The executable examples share `import torch`, `import nnsight`, `from nnsight import NNsight, TransformersModel, Envoy`, and a GPT-2 `model` from the first example unless they define their own model. Implementation excerpts are identified explicitly; GPU and live-service examples state their requirements. See [the example checks](tests/test_markdown_examples.py) for the execution inventory.
 
-This document provides an overview of the design choices and implementation details of NNsight. Its purpose is to serve as a **source of truth** for understanding how NNsight works internally, enabling developers and users to reason correctly about its behavior.
+> A manual for people who want to understand what nnsight is, why it works the way
+> it does, and how each piece fits together. Read it front to back once for the
+> mental model; keep it open as a reference after that.
+
+## Goal of this document
+
+nnsight lets you run a neural network and, in the middle of that run, **read and
+edit any internal value** — a layer's output, an attention pattern, a gradient — by
+writing ordinary Python as if you already had the value in hand. The same code runs
+on a model on your laptop or on a 405B-parameter model hosted remotely.
+
+This document explains the whole system: the problem it solves, the design
+principles behind it, and how the layers — tracing, interleaving, the envoy tree,
+the feature set, the model wrappers, remote execution — actually work. It favors the
+*why* and the mental model over exhaustive API listing; the recipe-style pages under
+[`docs/`](https://github.com/ndif-team/nnsight/tree/main/docs) (routed by [`CLAUDE.md`](CLAUDE.md)) are the task reference, and the
+source is the final word. Where a section maps to a `docs/` page or a source file,
+it says so.
+
+This is 0.8 — the pipeline rewrite. If you knew an older nnsight, see
+[What changed in 0.8](#what-changed-in-08) and
+[docs/reference/version-history.md](https://github.com/ndif-team/nnsight/blob/main/docs/reference/version-history.md).
 
 ---
 
 ## Table of Contents
 
-1. [Introduction](#1-introduction)
-   - [The Intervention Problem](#the-intervention-problem)
-   - [Current Approaches and Their Limitations](#current-approaches-and-their-limitations)
-   - [Design Principles](#design-principles)
-   - [Goals of NNsight](#goals-of-nnsight)
-2. [Tracing](#2-tracing)
-   - [Overview](#overview)
-   - [Capture](#21-capture)
-   - [Parse](#22-parse)
-   - [Compile](#23-compile)
-3. [Interleaving](#3-interleaving)
-   - [Overview](#overview-1)
-   - [The Interleaver](#31-the-interleaver)
-   - [The Mediator](#32-the-mediator)
-4. [Envoy](#4-envoy)
-   - [Overview](#overview-2)
-   - [The Envoy Tree](#41-the-envoy-tree)
-   - [Accessing Values](#42-accessing-values)
-   - [Source Tracing](#43-source-tracing)
-   - [Method Delegation and Tracing](#44-method-delegation-and-tracing)
-   - [Aliasing](#45-aliasing)
-   - [Handling Conflicts](#46-handling-conflicts)
-   - [Dispatching and Updates](#47-dispatching-and-updates)
-   - [Ad-hoc Module Calls](#48-ad-hoc-module-calls)
-   - [Device Utilities](#49-device-utilities)
-   - [Envoy Tree Navigation](#410-envoy-tree-navigation)
-   - [Accessing the Underlying Module](#411-accessing-the-underlying-module)
-5. [Features](#5-features)
-   - [Saving Values](#51-saving-values)
-   - [Ad-hoc Module Calls](#52-ad-hoc-module-calls)
-   - [Multi-Token Generation](#53-multi-token-generation)
-   - [Model Editing](#54-model-editing)
-   - [Module Skipping](#55-module-skipping)
-   - [Gradients](#56-gradients)
-   - [Early Stopping](#57-early-stopping)
-   - [Barriers](#58-barriers)
-   - [Scanning](#59-scanning)
-   - [Caching](#510-caching)
-   - [Trace Result](#511-trace-result)
-6. [Modeling](#6-modeling)
-   - [Overview](#overview-3)
-   - [Mixin Architecture](#61-mixin-architecture)
-   - [Batching](#62-batching)
-   - [LanguageModel](#63-languagemodel)
-   - [DiffusionModel](#64-diffusionmodel)
-   - [vLLM](#65-vllm)
-7. [Debugging](#7-debugging)
-   - [The Challenge](#71-the-challenge)
-   - [Exception Reconstruction](#72-exception-reconstruction)
-   - [Line Number Reconstruction](#73-line-number-reconstruction)
-   - [Where Exceptions Are Caught](#74-where-exceptions-are-caught)
-   - [DEBUG Mode](#75-debug-mode)
-   - [What Users See](#76-what-users-see)
-   - [Common Exceptions](#77-common-exceptions)
-   - [Debugging Strategies](#78-debugging-strategies)
-8. [Remote Execution](#8-remote-execution)
-   - [NDIF Overview](#81-ndif-overview)
-   - [Setup](#82-setup)
-   - [Basic Remote Execution](#83-basic-remote-execution)
-   - [Remote Model Parameters](#84-remote-model-parameters)
-   - [Saving Results](#85-saving-results)
-   - [Sessions for Remote Execution](#86-sessions-for-remote-execution)
-   - [Gradients Remotely](#87-gradients-remotely)
-   - [Python Module Whitelist](#88-python-module-whitelist)
-   - [Limitations](#89-limitations)
-   - [Hybrid Execution with tracer.local()](#810-hybrid-execution-with-tracerlocal)
-   - [Print Statements and Logging](#811-print-statements-and-logging)
-   - [Implementation Details](#812-implementation-details)
-9. [Extending NNsight](#9-extending-nnsight) *(coming soon)*
+1. [Introduction](#1-introduction) — the intervention problem, prior approaches, design principles, what changed in 0.8
+2. [The mental model](#2-the-mental-model) — deferred execution, the trace, interleaving, the envoy tree
+3. [Tracing](#3-tracing) — capture, parse, execute
+4. [Interleaving](#4-interleaving) — the Interleaver, the Mediator, greenlets, the event protocol, batching
+5. [The Envoy](#5-the-envoy) — the tree, eproperties, reading and editing values, source tracing, skip, aliasing, dispatch, ad-hoc calls, navigation, `envoys=`
+6. [Features](#6-features) — save, generate vs pipe, iteration, edit, skip, gradients, barriers, scan, cache, `tracer.result`, sessions
+7. [Modeling](#7-modeling) — the mixins, batching, `TransformersModel`, `DiffusionModel`, `VLLM`, deprecated aliases
+8. [Debugging](#8-debugging) — clean tracebacks, DEBUG / `-v`, the errors you'll hit
+9. [Remote execution](#9-remote-execution) — NDIF, config, blocking / non-blocking / async, sessions, `remote="local"`
+10. [Extending nnsight](#10-extending-nnsight) — subclassing, eproperties, `envoys=`, custom batchers, runtimes
+11. [Performance](#11-performance) — the overhead model, best practices, profiling
 
 ---
 
 ## 1. Introduction
 
-### The Intervention Problem
+### The intervention problem
 
-Interventions for model inference follow a consistent pattern:
+Interpreting and steering a neural network means getting *inside* the forward pass:
+reading the residual stream at layer 12, zeroing an attention head, adding a steering
+vector before the next token, taking the gradient of a loss with respect to a hidden
+state. The values you want are transient — they exist for a few microseconds inside
+`model(x)` and are gone.
 
-1. **Define a function to execute** (typically a model forward pass)
-2. **Define logic to capture or manipulate intermediate values** within that function
-3. **Execute the function** with the interventions applied as defined
+PyTorch's own answer is the **forward hook**: register a callback on a module and it
+fires with that module's inputs and outputs. Hooks work, but they don't *compose*.
+A hook is a separate function with its own scope; to combine "read layer 5, use it
+to edit layer 8, then read the final logits" you juggle callbacks, closures, and
+mutable state, all written inside-out relative to the order things actually happen.
+And a hook only sees module *boundaries* — to reach a value computed *inside* a
+forward method (the attention scores before they're projected) you have to edit the
+model's code. None of it survives being sent to a model you don't have locally.
 
-This pattern appears throughout interpretability research: activation patching, causal tracing, steering, probing, and countless other techniques all require the ability to observe and modify the internal computations of a neural network during inference.
+### What nnsight does instead
 
-### Current Approaches and Their Limitations
+nnsight lets you write the intervention as **straight-line code in the order it
+happens**, against the values as if they were already there:
 
-In the current interpretability landscape, interventions typically take one of three forms:
+```python
+import torch
+import nnsight
+from nnsight import NNsight, TransformersModel, Envoy
 
-#### 1. Hooks
+REMOTE = "local"  # Offline serialization; True requires an NDIF 0.8 deployment
+model = TransformersModel("openai-community/gpt2", task="text-generation", dispatch=True, attn_implementation="eager")
 
-Users define callback functions that execute at module input and output boundaries. These functions receive the inputs or outputs of a given module and can return a modified value to replace the original.
+with model.trace("The Eiffel Tower is in"):
+    hidden = model.transformer.h[5].output      # read layer 5's output
+    model.transformer.h[8].output[:] = hidden   # write it into layer 8
+    logits = model.output.logits.save()            # keep the final logits
 
-**Limitations:**
-- Setup can be unintuitive—hooks must be registered beforehand and managed carefully
-- Complex intervention logic requires managing state across multiple hook functions
-- Interventions are limited to module boundaries; you cannot hook into arbitrary operations within a module's forward pass
+print(logits.argmax(-1))
+```
 
-#### 2. Model-Specific Support
+Inside the `with` block you are not running the model — you are describing what to do
+when it runs. `model.transformer.h[5].output` doesn't return a tensor immediately; it
+parks the worker until the model reaches layer 5, then returns the real tensor. There are no proxy tensors in this execution engine. Assigning to `.output` doesn't mutate a local — it schedules a substitution
+into the forward pass. `.save()` marks a value to survive past the block. When the
+`with` exits, nnsight runs the model and your code **interleaved**, so each read
+blocks until the model produces that value and each write lands before the model
+reads it.
 
-Some models expose parameters that enable intervention or observation. Examples include `output_hidden_states` in HuggingFace Transformers, or explicit LoRA support.
+This is the whole idea: **you write against the values; nnsight arranges for them to
+be there.** Three things fall out of it:
 
-**Limitations:**
-- Requires model developers to have explicitly added the intervention functionality
-- Different models have different APIs, creating inconsistency
-- Often provides only a subset of what researchers actually need
+- **It composes.** Interventions are ordinary Python — loops, conditionals, function
+  calls, intermediate variables. The order you write is the order they run.
+- **It reaches inside forwards.** [Source tracing](#54-source-tracing) (`.source`)
+  exposes the individual operations of a module's `forward`, not just its boundary.
+- **It runs anywhere.** The block is captured as *source code plus the values it
+  references*, so the identical trace can be shipped to [NDIF](#9-remote-execution)
+  and run on a model far too large for your machine — see
+  [remote execution](#9-remote-execution).
 
-#### 3. Model Source Editing
+### Design principles
 
-Developers manually modify the model's source code to add logging, capture intermediate values, or change behavior.
+Everything downstream follows from a few commitments:
 
-**Limitations:**
-- Requires deep understanding of potentially complex source code
-- Dangerous when iterating on experiments—it's easy to lose track of what has changed
-- Difficult to share or reproduce edits across collaborators
-- Changes are permanent unless carefully version-controlled
+1. **Interventions are code, not callbacks.** The primary interface is a `with`
+   block of normal Python read/write against activations. No registration, no
+   callback soup.
+2. **The same trace runs locally or remotely.** A trace is serializable by
+   construction (source + referenced values), so `remote=True` changes *where* it
+   runs, not *what* you wrote.
+3. **Execution is deferred and interleaved.** The block is captured, then run
+   step-for-step with the model. A read parks until the model gets there; a write
+   is spliced in. This is what makes straight-line intervention code possible.
+4. **Model-agnostic core, batteries on top.** The engine wraps any
+   `torch.nn.Module` ([`NNsight`](#7-modeling)); the HuggingFace, diffusers, and
+   vLLM wrappers add loading, tokenization, and batching without changing the core.
+5. **Get out of the way.** The overhead is per-value-access bookkeeping around the
+   model's own compute, which dominates (see [Performance](#11-performance)). You
+   pay for what you touch.
 
-### Design Principles
+### What changed in 0.8
 
-An ideal intervention library should:
+0.8 is a ground-up rewrite around a compile-and-interleave pipeline. The
+old→new delta, for readers of an earlier nnsight, is
+[docs/reference/version-history.md](https://github.com/ndif-team/nnsight/blob/main/docs/reference/version-history.md); the rest of
+this document describes 0.8 as it is.
 
-1. **Be low-level:** Express arbitrary logic at any point in the computation graph
-2. **Minimize non-intervention syntax:** Intervention code should look like normal Python—no special DSLs, decorators, or registration patterns that obscure intent
-3. **Make no permanent edits:** The model itself remains unmodified; interventions are applied only during traced execution
-4. **Support remote execution:** The internal representation of interventions should be serializable and transmittable for execution on remote infrastructure (NDIF)
+---
 
-### Goals of NNsight
+## 2. The mental model
 
-NNsight serves three interconnected purposes:
+Hold four ideas and the rest of the document is detail.
 
-1. **Customizable Neural Network Inference**
-   
-   Allow users to interact with model internals during inference, expressing interventions at arbitrary locations with arbitrary complexity.
-   
-   *Use case:* A user-facing service for advanced language model inference that uses NNsight in the backend with specific interventions for steering, logit lens, or other observability features.
+**1. A trace is captured, not run.** `with model.trace(x):` does not execute its body
+line by line. nnsight grabs the block's source (as an AST), compiles it, and sets it
+aside. Nothing in the body runs against real tensors yet. This is *deferred
+execution* — see [Tracing](#3-tracing).
 
-2. **Interpretability Toolkit**
-   
-   Provide the building blocks for interpretability research: activation patching, causal interventions, probing, steering, and more.
+**2. The model and your block run interleaved.** On exit, nnsight starts the model's
+forward pass and your captured block *at the same time*, in one thread, handing
+control back and forth. Your block runs until it asks for a value the model hasn't
+produced (`model.transformer.h[5].output`); it parks there. The model runs until it
+reaches that module; it hands the value over and your block resumes. This is
+*interleaving*, and the machinery is a shared [`Interleaver`](#41-the-interleaver)
+plus one [`Mediator`](#42-the-mediator) greenlet per block. See
+[Interleaving](#4-interleaving).
 
-3. **API for NDIF**
-   
-   Enable remote execution of interventions on NDIF infrastructure, democratizing access to large-scale model internals.
+**3. You address the model through an envoy tree.** `model.transformer.h[5]` is not
+the module — it's an [`Envoy`](#5-the-envoy), a lightweight mirror of the module tree.
+Every envoy exposes `.input` / `.output` (and `.source`, `.skip`, gradients) as the
+hooks into the run. Reading one parks your block; assigning to one schedules a swap.
+The tree is built once when you load the model and mirrors the real modules exactly.
 
-### The Context Manager Abstraction
+**4. Values leave the block only if you `save()` them.** The block runs in a scratch
+namespace; when it's done, only values you marked with `.save()` (or
+`nnsight.save(x)`) are pushed back to your frame. Everything else is discarded with
+the trace. See [Saving values](#61-saving-values).
 
-To express interventions naturally, NNsight uses Python's context manager (`with` block) as its core abstraction:
+Put together: you *describe* interventions against an envoy tree, nnsight *captures*
+that description, then *interleaves* it with the model, and hands back what you
+*saved*. Local or remote, that's the shape of every nnsight program.
+
+---
+## 3. Tracing
+
+The intervention block you write inside `with model.trace(...):` never runs where
+it stands. When Python reaches that line, nnsight steps in, reads the block's
+source, sets the body aside, and arranges for the body to run later — [interleaved
+with the model's forward pass](#4-interleaving). *Tracing* is the machinery that
+performs that sleight of hand: it turns a `with` block into a code object nnsight
+can run on its own terms.
+
+The reason it works this way is the whole premise of the library. To let you write
+`hidden = model.transformer.h[5].output` as if the value were already in hand, the
+line can't execute when Python gets to it — the model hasn't run yet, so there is no
+value. So the body is *captured* rather than executed, then handed to a **backend**
+that decides where and how it runs. The base backend runs it in place; a remote
+backend ships it to [NDIF](#9-remote-execution). The tracer doesn't know the
+difference — swapping the backend is the whole seam between a local run and a remote
+one.
+
+The pipeline is deliberately small and layered. Everything in this section lives in
+`src/nnsight/tracing/` — a self-contained "capture a `with` block and run it through
+a backend" library that imports no torch and knows nothing of models or
+interventions. The intervention-specific behavior (running the body against a live
+model) is one overridden method, `execute`, in
+`src/nnsight/intervention/tracer.py`. The base `Tracer`
+(`src/nnsight/tracing/tracer.py`) does five steps, each overridable: **capture**,
+**parse**, **build**, **compile**, **execute**. Below they group into three: capture
+(grabbing the block), parse (turning it into code, via build and compile), and
+execute (running it through the backend). For the recipe-level view see
+[docs/concepts/deferred-execution.md](https://github.com/ndif-team/nnsight/blob/main/docs/concepts/deferred-execution.md) and
+[docs/developing/tracing-pipeline.md](https://github.com/ndif-team/nnsight/blob/main/docs/developing/tracing-pipeline.md).
+
+### 3.1 Capture
+
+`model.trace("The Eiffel Tower is in")` constructs a tracer and stores the call
+arguments; nothing is read yet. The work starts when the `with` block *enters*.
+`Tracer.__enter__` calls `capture()`, which looks two frames up (`sys._getframe(2)`,
+past `__enter__`) to find the user's frame — the one that ran the `with` statement.
+From that frame it has everything it needs: the filename, the line number of the
+`with`, and the live globals and locals the block was written against.
+
+Capture reads the source text of that file (`Tracer.source`) and parses out the
+`with` node at that line, then compiles the block's body into a standalone code
+object. The parse and compile are pure functions of *where the trace sits in the
+code*, so their results are memoized per call site in a process-wide cache, `BLOCKS`
+(`src/nnsight/tracing/globals.py`), keyed by
+`(filename, lineno, co_name, co_firstlineno)`:
+
+> **Implementation excerpt:** illustrates internal contracts; it is not a standalone recipe. The example checks compile it and exercise the corresponding installed implementation.
+
+```python
+key = (code.co_filename, frame.f_lineno, code.co_name, code.co_firstlineno)
+if key not in BLOCKS:
+    source = self.source(code.co_filename)
+    node = self.parse(source, frame.f_lineno)
+    compiled = None if node is None else self.compile(self.build(node), frame)
+    BLOCKS[key] = (node, compiled)
+```
+
+A `with model.trace(...)` inside a Python loop is therefore read, parsed, and
+compiled exactly once — every later iteration is a dict lookup. A site that turns
+out *not* to be a `with` block caches `(None, None)`, so even that negative verdict
+isn't re-derived on each call (it lets `capture` raise `WithBlockNotFoundError`, the
+signal a plain `envoy.method(...)` call uses to fall back to running normally).
+Source text is cached separately in `SOURCES`, read once per file and never
+re-validated — a file edited mid-run is traced as it was first seen, and since the
+cache key includes the line number, ordinary edits invalidate on reload anyway.
+
+Source lookup handles three contexts: ordinary files and IPython/Jupyter cells
+(both via `linecache` — IPython registers each cell there under the frame's
+filename), and `python -c "<code>"` programs (recovered from `sys.orig_argv`).
+Anything with no reachable source — a raw `exec` string, a heredoc, `<stdin>` —
+yields empty text, which fails the parse and raises `WithBlockNotFoundError`. The
+practical consequence: `with model.trace(...):` reads *its own source*, so it can't
+be run from a one-liner or an `exec`'d string that isn't itself the program. Write
+snippets to a real `.py` file.
+
+**Skipping the body inline.** Capturing the source isn't enough; the body must also
+be prevented from running where it sits. Still in `__enter__`, if the block has real
+code (`skippable` — a body that is only `pass`, a docstring, or `...` is left to run
+harmlessly), `skip_context` arms a per-frame trace hook (`frame.f_trace`) that
+raises `ExitTracingException` the instant execution reaches the body's first line.
+`ExitTracingException` is a control-flow signal, not an error — it's caught in
+`__exit__` and never surfaces to you. Because Python delivers trace events per
+*line*, one constraint falls out: the body must start on its own line. A one-liner
+like `with model.trace(x): y = model.output.save()` is refused with a clear
+`ValueError`, because a body written on the `with` line would run where it stands
+*and* again through the backend. A multi-line `with` header (arguments spread over
+several lines) is fine — the hook stays armed until it reaches the body, so the `as`
+target binds before the block is skipped.
+
+### 3.2 Parse
+
+Parsing finds the `ast.With` (or `ast.AsyncWith`) node that starts on the trace line
+and turns its body into a compilable code object. Parsing a whole source file is
+`O(its AST)` and dominates a cold capture, so `parse` first tries `_parse_block`,
+which slices *just* the block out of the source — the (possibly multi-line) header
+and its body, bounded by indentation and open-bracket depth — dedents it to column
+0, parses that alone, and shifts the line numbers back so tracebacks and the skip
+hook still point at the real file. Getting the slice bound wrong is safe by
+construction: collecting too much just parses a few trailing statements (the `with`
+is still `body[0]`); collecting too little makes the slice unparseable, which
+returns `None` and falls back to parsing the whole file. It never returns a wrong
+node.
+
+From the node, two more steps produce the code object. `build` wraps the block's
+*body* — not the `with` line itself — in an `ast.Module` and backfills line/column
+info with `fix_missing_locations`. `compile` compiles that module under the original
+frame's filename and sets its `co_name` to the frame's name, so a traceback from
+inside the body reads as if it ran where it was written. The `(node, compiled)` pair
+is what lands in the `BLOCKS` cache. The node is kept because it's needed again for
+[remote serialization](#9-remote-execution): a block that rides to a server is
+reduced to *source plus the variables it references*, cross-version-safe, rather
+than shipping a compiled code object.
+
+### 3.3 Execute
+
+When Python unwinds the `with`, `__exit__` runs. For the expected
+`ExitTracingException` (the body was skipped) — or a clean exit, when there was
+nothing to skip — it invokes the backend, which is the one line that says what "run
+the block" means:
+
+> **Implementation excerpt:** illustrates internal contracts; it is not a standalone recipe. The example checks compile it and exercise the corresponding installed implementation.
+
+```python
+class Backend:
+    def __call__(self, tracer: Tracer) -> None:
+        tracer.execute(tracer.info.code)
+```
+
+So the backend is just a dispatch seam; the behavior lives in `execute`. The base
+`Tracer.execute` runs the compiled body against a scratch namespace and pushes the
+results back:
+
+> **Implementation excerpt:** illustrates internal contracts; it is not a standalone recipe. The example checks compile it and exercise the corresponding installed implementation.
+
+```python
+scope = Scope(dict(frame.f_locals), frame.f_locals, frame.f_globals)
+exec(code, scope)
+push_result(frame, scope)
+```
+
+The block runs in a `Scope` (`src/nnsight/tracing/util.py`), not directly in your
+frame, because it runs later than the line it was written on — and, once
+interleaving, in a greenlet somewhere else entirely. A `Scope` resolves names from
+three places in order: a *snapshot* of the frame's locals taken at capture (so a
+`for prompt in prompts:` loop variable means what it meant where the block was
+written, even though the loop has moved on by the time the block runs), the *live*
+locals of the frame (so a name bound by a sibling `tracer.invoke(...)` block is
+visible), and the globals by fallback. Assignments made in the block land in the
+scope, so they survive to be pushed back; `push_result` then filters them — see
+[Saving values](#61-saving-values) for why only `.save()`-marked values leave the
+outermost trace, while a nested trace pushes everything up to its enclosing block.
+
+`InterleavingTracer.execute` (`src/nnsight/intervention/tracer.py`) overrides this
+to run the body *interleaved with the model's forward pass* instead of plainly. It
+builds a [`Batcher`](#44-batching-narrow-and-widen) and one or more
+[`Mediator`](#42-the-mediator) workers, then hands them to `Envoy.interleave` to run
+alongside `fn(*input)` (the model's `__call__`, or `generate`, ...). Which shape it
+takes depends on whether `trace()` itself got input:
+
+- **Direct-input mode** (`trace(x)`) — the whole block is one implicit invoke over
+  `x`. `execute` builds a single `Mediator` for the entire body, gives it the
+  input's batch group, and runs it.
+- **Invoke mode** (`trace()` with no input) — the block is run *now*, once, purely
+  to collect its `with tracer.invoke(...)` sub-blocks. Each invoke captures its own
+  body and registers its own input and worker (see
+  [Batching](#44-batching-narrow-and-widen) and [§7.2](#72-batching)); their inputs
+  are then combined into one batched forward. If the body registers no invokes and
+  `trace()` had no input, that's an error — `trace()` needs an input or at least one
+  invoke block.
+
+`ScanningTracer` (behind `model.scan(...)`) is the same machinery with one wrapper:
+it defers to `InterleavingTracer.execute` inside a `FakeTensorMode`, so the forward
+propagates only tensor *metadata* — shape, dtype, device — with no real compute and
+no weights loaded. This lets you check activation shapes on an undispatched model
+without running it for real. The values read inside a scan are fake tensors, valid
+only within the block: read their `.shape`/`.dtype` there, but a fake tensor saved
+out of the scan is unusable once the fake mode exits. Scan and trace share the same
+`_batch_size`/`_batch` preprocessing, so a string prompt is tokenized and invokes
+are batched exactly as in a real trace. See [docs/usage/scan.md](https://github.com/ndif-team/nnsight/blob/main/docs/usage/scan.md).
+
+Whichever tracer runs, `execute` ends by pushing each worker's saved values back
+into your frame and clearing the interleaver so the next run starts clean. If the
+backend raises, `__exit__` re-raises with a cleaned traceback that drops nnsight's
+own frames, leaving your code — see [Debugging](#8-debugging). Any exception from the
+body that *isn't* the skip signal propagates normally.
+
+## 4. Interleaving
+
+Interleaving is the heart of nnsight — the part that makes reading and editing
+activations from straight-line code actually work. The problem it solves: your
+intervention code and the model's forward pass have to run *in lockstep*. Your code
+pauses whenever it asks for a value the model hasn't produced yet; the model runs
+until it reaches that value, hands it over, and your code resumes — possibly editing
+the value on the way back in.
+
+nnsight implements this with **greenlets** (cooperative, single-threaded
+coroutines), not OS threads. A worker and the model take strict turns on one thread,
+so there are no locks, no queues, and no races — only control handed back and forth
+by explicit switches. This is why the mental model is so clean: at any instant
+exactly one of {the model, one worker} is running, and a worker only ever runs
+between the two model events it cares about. Everything in this section lives in
+`src/nnsight/intervention/interleaver.py` (plus `batching.py` and `barrier.py`); the
+concept pages are
+[docs/concepts/interleaver-and-controller.md](https://github.com/ndif-team/nnsight/blob/main/docs/concepts/interleaver-and-controller.md) and
+[docs/concepts/threading-and-mediators.md](https://github.com/ndif-team/nnsight/blob/main/docs/concepts/threading-and-mediators.md).
+
+### 4.1 The Interleaver
+
+An `Interleaver` drives the model side. One is shared across an entire
+[`Envoy`](#5-the-envoy) tree, so every module in the model reports into the same set
+of workers. It owns two things: the per-module controllers that turn a forward
+pass into a stream of events, and the list of `Mediator` workers those events feed.
+
+**One controller per module.** When an envoy is built, the interleaver's
+`instrument` method installs a *controller* as that module's `forward` — once, at
+construction time, for the model's lifetime. On every call the controller hands
+the module's `(args, kwargs)` through `handle("{path}.input", ...)`, consults the
+`.skip` gate, runs the real forward, and hands the output through
+`handle("{path}.output", ...)`. Because both handoffs *return* the value they
+handle, an intervention can edit the input or the output in place. `.inputs`
+exposes the full argument pair, `.input` the first argument. There are no PyTorch
+forward hooks — that is deliberate: a module with no hooks is called on PyTorch's
+fast path, and the controller costs one frame and one check when no trace is
+running. Under transformers tensor parallelism the controller runs inside the
+wrapper transformers installs over `module.forward` to carry the style's
+collectives, so it sees a partial sum or a shard there, which `TPFragments`
+makes whole only when a worker is waiting for it.
+
+The single most important property of the controller is that it **passes through
+when idle**. Its first line asks the module's `_State` which interleaver is running
+(`interleaving` is `True` between `__enter__` and `__exit__`) *and* has workers
+(`busy`); with neither it runs the body and returns. So an instrumented model runs
+at normal speed whenever you aren't tracing; the cost when idle is one frame and one
+check per module call, nothing more. The controller is permanent: nothing is
+installed or removed around a run.
+
+`instrument` also installs the per-module **source/skip controller** (see
+[Source tracing](#54-source-tracing) and
+[docs/developing/controller.md](https://github.com/ndif-team/nnsight/blob/main/docs/developing/controller.md)), which replaces the
+module's `forward` to add the `.skip` gate and, on demand, operation-level access.
+The controller is registered up front so it's in place before `nn.Module.__call__`
+binds `forward` — necessary because a skip's replacement can be read from the
+module's own input first. `instrument` runs again on dispatch (`Envoy._update`, when
+meta weights are swapped for real ones): the new module gets its own controller;
+the meta module's doesn't carry over.
+
+**`handle`: one call, every worker.** Everything the model side does routes through
+`Interleaver.handle(provider, value)`. It offers `value` at that location to every
+mediator in `mediators` order (so if two invokes both edit the same location, invoke
+0's edit lands before invoke 1's — definition order); each worker either reads it,
+edits it, or ignores it, and the possibly-edited value threads through to the next.
+Afterward, the post-intervention value is offered to any active
+[`tracer.cache()`](#6-features) observers, narrowed to each cache's own batch rows,
+so a cache records exactly what interventions produced. The edited value returns to
+the controller, which substitutes it back into the forward.
+
+That one primitive — a location string plus `handle` — carries *everything*, not
+just module boundaries. The model's return value isn't produced by any module,
+so `Envoy.interleave` calls `handle("result", result)` after the forward to serve
+anything parked on [`tracer.result`](#6-features). The `.skip` gate is
+`handle("{path}.skip", ...)`. Source operations inside a forward are
+`handle("{path}.source.<op>.output", ...)`. A custom runtime that computes a value
+PyTorch never surfaces (vLLM's logits) plumbs it in the same way. There is no
+separate event type for any of these — they're all the one primitive, which is why
+[extending nnsight](#10-extending-nnsight) with a new hookable value means adding a
+*location*, not a hook.
+
+One interleaver persists across many runs. `__enter__` flips `interleaving` on and
+starts every not-yet-started worker; `__exit__` flips it back off (swallowing an
+intentional `EarlyStopException` from `tracer.stop()`); `cancel` then clears the
+workers and the batcher so the next run starts clean. The controllers themselves are never
+touched — a server reuses the same interleaver, request after request.
+
+### 4.2 The Mediator
+
+Each block of intervention code becomes one `Mediator` — the body of a direct-input
+`trace(...)`, or one `with tracer.invoke(...)`, or one registered
+[edit](#6-features). A mediator wraps the captured block and runs it inside its own
+greenlet, the **worker**. The worker drives the interaction: it runs the block until
+the code asks for a value, then *parks* — recording what it's waiting for in
+`pending` and switching control back to the parent greenlet (the model side). The
+parent later resumes it once the model reaches the awaited location.
+
+The mediator carries the block's compiled `code` and the `Scope` (`lcls`) it runs
+against — its capture-time names, the frame it shares with sibling blocks, and the
+globals behind them. This scope doubles as what `push_result` reads the block's
+saved values back out of when the run finishes. A mediator built for an
+[edit](#6-features) runs with `copy=True`, so it execs against a fresh copy of its
+scope on every replay and doesn't accumulate the last run's names.
+
+`start` creates the worker greenlet, stashes a weakref back to the mediator on it
+(so intervention code can find *its own* mediator via `getcurrent().mediator()` — the
+mechanism behind `tracer.iter` and `tracer.barrier()`), and switches in, running the
+block up to its first park. A worker's whole life is visible through `alive`, which
+is `True` only while the worker exists and still has code left to run — `False`
+before `start` and, crucially, `False` after the block finishes, because a greenlet
+is falsy once it has run to completion. There is no "worker done" event; a finished
+worker is just an `alive == False` mediator.
+
+Two methods move control across the greenlet boundary, and they are exact
+counterparts. On the worker side, `event` switches to the parent handing over an
+event tuple and blocks until a value is switched back — this is what every park call
+bottoms out in. On the parent side, `switch` resumes the worker with a value and
+returns whatever the worker parks on next, or `None` when the worker finishes. If
+the worker raises, `switch` stashes a clean, intervention-only traceback on the
+exception (as `__intervention_tb__`) *before* the re-raise unwinds the model and hook
+frames on top of it, so [Debugging](#8-debugging) can show you your own code rather
+than nnsight's plumbing — then the exception propagates and halts the run.
+
+### 4.3 The event protocol
+
+A worker parks by switching a tuple `(Event, location, ...)` to its parent. There
+are exactly four kinds of event, and their one-line contracts are the whole
+vocabulary of interleaving:
+
+| Event | Raised by | Means |
+|---|---|---|
+| `VALUE` | `Mediator.value(loc)` | Read the value at `loc`; park until the model reaches it. |
+| `SWAP` | `Mediator.swap(loc, v)` | Replace the value at `loc` with `v` on the model's way past. |
+| `SKIP` | `Mediator.skip(loc, v)` | Skip the computation gated at `loc`, using `v` as its result. |
+| `BARRIER` | `Mediator.barrier()` | Wait for the other blocks; names no location. |
+
+The [`Envoy`](#5-the-envoy) properties are thin wrappers over these: reading
+`envoy.output` is `Mediator.value("{path}.output")`; `envoy.output = x` is
+`Mediator.swap("{path}.output", x)`; `envoy.skip(v)` is `Mediator.skip`. `BARRIER`
+is the odd one out — it names nothing the model produces, so the model side never
+serves it; another worker does, on its way past the same barrier.
+
+There is no `END` event and no `EXCEPTION` event. A worker finishing is just its
+greenlet running to completion (`switch` returns `None`); an error is just an
+exception propagating out of `switch`. The protocol is only these four requests.
+
+**Park and switch, concretely.** A read illustrates the full cycle. The worker runs
+to `hidden = model.transformer.h[5].output`, which calls `Mediator.value(...)`; that
+switches `(Event.VALUE, "model.transformer.h.5.output.i0")` to the parent and
+blocks. Control is now on the model side, which runs the forward until layer 5's
+controller hands its output to `Interleaver.handle`, which calls the worker's `handle` for that
+location. The worker's pending event matches, so `handle` switches the value into
+the worker, which resumes with the tensor in `hidden`, runs to its next park (or
+finishes), and hands control back. A write is the same shape: `swap` parks the same
+way, but when the model reaches the location `handle` substitutes the worker's value
+for what the model produced before resuming the forward. A worker can read *then*
+write the same location — `handle` loops while the worker keeps parking on the same
+location, so a read followed by an assignment to `.output` both drain on one visit
+before the model moves on.
+
+**Occurrence tags (`.i{n}`).** A location can be reached many times in one run —
+every step of a generation loop revisits every module. Each park carries the
+occurrence the worker wants, appended to the location as `.i{n}`. With no
+`tracer.iter`, `n` is always `0`, so every request binds to the *first* visit — the
+plain single-forward behavior. `tracer.iter[k]` pins the worker to occurrence `k`;
+its request tagged `.i{k}` simply doesn't string-match earlier visits and waits
+while they pass by, binding on the k-th. `handle` tracks per-location visit counts
+(`iterations`) and tags each visit accordingly, so matching is a single string
+comparison with no numeric bookkeeping in the hot path. (After the first hit of a
+pinned non-zero step, the worker *relaxes* so the rest of that step's requests follow
+the model sequentially rather than re-forcing the index.) Because a source operation
+also goes through `handle` every time it fires, an op inside a loop advances its own
+occurrence counter per fire while a module advances once per forward — the iteration
+model falls out of the one primitive, with no extra counters. See
+[Features](#6-features) for `tracer.iter` / `tracer.all()`.
+
+**Errors and dangling workers.** Within one worker, requests happen in execution
+order and the model runs in forward order, so asking for an *earlier* location after
+a *later* one is impossible to satisfy — the earlier module has already run past, and
+its next visit will never come. This surfaces as `OutOfOrderError`. It's caught after
+the model returns, by `check_dangling_mediators`, which inspects any worker still
+parked:
+
+- A plain request (`iteration == 0`) for a location the model ran past or never
+  reached is a real error: `OutOfOrderError` is thrown *into* the worker, so the
+  traceback points at the exact line that was waiting.
+- A request inside a `tracer.iter` loop that outran the model's steps — bounded or
+  open — is handled the same way: the error is thrown to unwind the worker (running
+  its `finally` blocks), then caught and turned into a warning. Values from steps
+  that did run are already saved. The unwinding discards everything after the loop,
+  so a loop that outruns the run hands back a result that looks complete — bound
+  the loop to a count the run makes (`min_new_tokens=` holds a generation there)
+  to keep trailing code.
+- A `BARRIER` still pending means fewer blocks reached the barrier than its count —
+  a `ValueError` points at the waiting line.
+
+The common practical version: read a module's `.input` *before* its `.output`, and
+to access modules in a different order use a separate invoke (a separate worker over
+the same forward). `tracer.barrier(n)` is the tool for the cross-worker case — a
+meeting point `n` blocks agree on, where the last to arrive releases the rest, so a
+value read in one invoke is guaranteed written into another only after the read. See
+[Barriers in Features](#6-features) and [§7.2](#72-batching).
+
+### 4.4 Batching: narrow and widen
+
+A single `with model.trace() as tracer:` can hold several `with tracer.invoke(x):`
+blocks, whose inputs are combined into one batched forward while each block's
+interventions see only *its* rows of every activation. Each invoke is one worker,
+scoped to a `batch_group` — a `[start, size]` row range in the combined batch. The
+per-trace `Batcher` (`src/nnsight/intervention/batching.py`) collects the invokes,
+assigns each its group, and does the row math at run time.
+
+The scoping is two mirror operations, driven from the worker's `handle`:
+
+- **On a read**, `Batcher.narrow(value, group)` slices every batched tensor down to
+  the worker's rows before serving it — so an invoke over one prompt sees
+  `output.shape[0] == 1` even though the real forward ran a batch of three. A tensor
+  counts as batched only when its leading dim equals the combined batch size, so
+  activations whose dim 0 is sequence length or hidden size pass through untouched.
+- **On a write**, `Batcher.widen(full, group, edited)` splices the worker's edited
+  rows back into the full batch — via `torch.cat` rather than in-place assignment, to
+  keep autograd correct for leaf and view tensors and to avoid aliasing when the
+  edit is itself a narrowed view of the full tensor.
+
+Narrowing and widening only actually happen when **two or more** non-empty invokes
+contribute rows (`Batcher.batching`). A lone invoke *is* the whole batch, so single-
+input traces pay no slicing overhead. An **empty** invoke (`tracer.invoke()` with no
+args) has no batch group and sees the whole combined batch — its own worker over
+every row, useful for logic that spans all invokes.
+
+The row math here is dim-0 only; equalizing everything else (padding shorter prompts
+to a common sequence length, building a combined attention mask) is the model's job,
+in `_batch`, when it assembles the combined input. That model side — `_batch_size`
+and `_batch`, the `TransformersModel` implementation, and custom batch layouts like
+diffusion's classifier-free-guidance doubling or vLLM's flat-token axis — is covered
+in [Batching](#72-batching) under [Modeling](#7-modeling); the concept page is
+[docs/concepts/batching-and-invokers.md](https://github.com/ndif-team/nnsight/blob/main/docs/concepts/batching-and-invokers.md) and
+the internals are in
+[docs/developing/batching-internals.md](https://github.com/ndif-team/nnsight/blob/main/docs/developing/batching-internals.md).
+
+---
+
+## 5. The Envoy
+
+An `Envoy` is how you *point at* a module. When you write
+`model.transformer.h[5].mlp`, you are not holding the `torch.nn.Module` — you are
+holding a lightweight mirror of it whose job is to give that module a stable
+address (`"model.transformer.h.5.mlp"`) and to expose its live values during a
+run. Everything you do inside a trace goes through an envoy: reading `.output`,
+overwriting `.input`, reaching an operation inside the forward with `.source`,
+skipping the module, taking a gradient. The envoy is the surface; the machinery
+underneath is the [Interleaver and the Mediator](#4-interleaving).
+
+The design is deliberately thin. An envoy owns almost no state of its own — a
+path, a reference to the wrapped module, a shared interleaver, and a list of
+children. The interesting behavior lives in a handful of *descriptors*
+([eproperties](#52-eproperties-how-values-are-hooked)) that turn attribute access
+into interleaver traffic, and in a per-module controller that
+[source tracing](#54-source-tracing) and [skipping](#55-skipping-a-module) share.
+Read this section to understand what the tree is, how `.input`/`.output` actually
+hook a value, and the smaller powers — source, skip, rename, dispatch, ad-hoc
+calls — that hang off the same tree.
+
+Source: `src/nnsight/intervention/envoy.py`, `src/nnsight/intervention/eproperty.py`,
+`src/nnsight/intervention/source.py`. Concept pages:
+[docs/concepts/envoy.md](https://github.com/ndif-team/nnsight/blob/main/docs/concepts/envoy.md),
+[docs/concepts/source-tracing.md](https://github.com/ndif-team/nnsight/blob/main/docs/concepts/source-tracing.md).
+
+### 5.1 The envoy tree
+
+An `Envoy` wraps one `torch.nn.Module` and mirrors its submodule tree. When you
+construct one — directly, or (far more often) through `NNsight(module)` or a wrapper
+like `TransformersModel` — it walks `module.named_children()` and builds a child
+envoy for each submodule, recursively. Every module in the model therefore has a
+matching envoy reachable by the *same attribute path* you'd use on the module
+itself:
+
+```python
+from nnsight.modeling.transformers import TransformersModel
+model = TransformersModel("openai-community/gpt2", task="text-generation", dispatch=True, attn_implementation="eager")
+
+model.transformer.h[0].mlp        # the Envoy for that GPT-2 block's MLP
+model.transformer.h[0].mlp.path   # 'model.transformer.h.0.mlp'
+```
+
+The **root envoy is the model**. `NNsight(module)` is nothing more than a root
+`Envoy` given the conventional name `"model"` for its path; `TransformersModel`,
+`DiffusionModel`, and `VLLM` are `Envoy` subclasses that add loading and
+tokenization on top of the identical tree. So `model` itself is an envoy, `model.output`
+is the whole model's output, and the children fan out below it.
+
+Each envoy holds the module it mirrors as `._module`. This is the escape hatch to
+the real PyTorch object — its parameters, its `state_dict`, its class — and it is
+what attribute access falls through to: if you ask an envoy for something it doesn't
+define, it looks on `._module` (and, if that yields a submodule not yet mirrored,
+wraps it as a child on the spot). A `ModuleList` mirrors as an indexable, iterable
+envoy, so `model.transformer.h[0]` and `for block in model.transformer.h:` both
+work.
+
+Children are stored in `._children` in module order, and the tree is built once, at
+construction. It does not rebuild on every trace — it is a fixed structure that the
+run flows *through*. (One exception: reassigning a module through the envoy, e.g.
+`model.transformer.h[0].adapter = MyAdapter()`, registers the new module and wraps
+it as a child; see [Ad-hoc module calls](#58-ad-hoc-module-calls).)
+
+### 5.2 eproperties: how values are hooked
+
+`.input`, `.inputs`, and `.output` look like plain attributes, but they are
+**eproperties** — a small subclass of Python's `property`
+(`src/nnsight/intervention/eproperty.py`). This one descriptor is the read/write
+plumbing behind essentially every value nnsight exposes: module input and output,
+a [source op's](#54-source-tracing) input and output, the run's
+[`tracer.result`](#6-features), a runtime's `.logits`. Understand the eproperty and
+you understand how any hookable value works.
+
+An eproperty is bound to a **location string**, `"{host.path}.{key}"` — so
+`model.transformer.h[0].output` reads the location
+`"model.transformer.h.0.output"`. Reading and writing the attribute are translated
+into interleaver traffic at that location:
+
+- **Reading** calls `Mediator.value(location)`. Your block's greenlet parks until
+  the model reaches that location and produces its value (see
+  [the Mediator](#42-the-mediator)).
+- **Writing** calls `Mediator.swap(location, value)` — the model, when it reaches
+  the location, substitutes your value and continues with it.
+
+Around that raw traffic, the eproperty runs up to three callbacks, and knowing which
+is which is the whole mental model:
+
+- **preprocess** — *the decorated stub itself.* It takes the raw value the
+  interleaver served and returns what you read. The base `.output` is an identity
+  view (`def output(self, value): return value`); `.input` is a preprocess that
+  digs the first argument out of the served `(args, kwargs)`.
+- **`.postprocess`** — the write side, run on the value you assign *before* it is
+  swapped in. `.input` uses it to repack your lone first argument back into the full
+  `(args, kwargs)` the module expects.
+- **`.transform`** — the write-back for an *edited view*. When a preprocess hands
+  back a reshaped or sliced view of the served value and you edit that view in
+  place, whether the edit is visible to the model depends on the kind of view. An
+  **aliasing** view — one that shares storage with the original, like
+  `.view(...).transpose(...)` — propagates in-place edits with no transform needed.
+  A **computed or copying** view — a per-head split that reshapes into new storage,
+  say — does not: your edits land on a copy the model never sees, so the eproperty
+  needs a `.transform` that maps the edited view back to the model's layout. It
+  fires once, after the block is done with that read, and its result is spliced in
+  as if you had swapped it.
+- **`.provide`** — the *serve* side, used from the model/driver rather than the
+  block. It hands a value to the interleaver at the eproperty's location so a worker
+  parked there resumes with it. This is how values that aren't module outputs get
+  served (the tracer serving `result`, a runtime serving `logits`); see
+  [Extending nnsight](#10-extending-nnsight).
+
+Here are the actual definitions, verbatim in spirit, of the three you use daily:
+
+> **Implementation excerpt:** illustrates internal contracts; it is not a standalone recipe. The example checks compile it and exercise the corresponding installed implementation.
+
+```python
+@eproperty(key="input")
+def inputs(self, value):                 # identity view of the whole (args, kwargs)
+    return value
+
+@eproperty
+def input(self, value):                  # first-argument view of the same location
+    args, kwargs = value
+    return first_input(args, kwargs)
+
+@input.postprocess                       # write side: repack the lone first arg
+def input(self, value):
+    args, kwargs = Mediator.value(f"{self.path}.input")
+    return replace_first_input(args, kwargs, value)
+
+@eproperty
+def output(self, value):                 # identity view of the module's output
+    return value
+```
+
+Note that `.input` and `.inputs` deliberately **share the key `"input"`** — both
+address `"{path}.input"`. They are two views of the same served value: `.inputs`
+gives you the full `(args, kwargs)`, `.input` the first argument. The `key=`
+argument exists precisely so several eproperties can offer different views of one
+location.
+
+The `description=` argument does one thing: it surfaces the eproperty as its own
+line in the `Envoy` repr, so a special hookable value (a model's `.logits`) shows up
+in the printed tree. The plain `.input`/`.output` carry no description and stay
+hidden. Accessing any eproperty **outside a trace** raises, because the mediator has
+nothing to serve:
+
+```
+ValueError: Cannot access `model.transformer.h.0.output` outside of interleaving
+```
+
+Full treatment of defining your own is in
+[Extending nnsight](#10-extending-nnsight) and
+[docs/developing/extending-envoy.md](https://github.com/ndif-team/nnsight/blob/main/docs/developing/extending-envoy.md).
+
+### 5.3 Reading and editing values
+
+Reading an envoy's `.output` inside a trace parks your block until the model reaches
+that module, then hands you the *real* runtime object — not a proxy. There is
+nothing to unwrap: `print`, `.shape`, `.mean()`, `.clone()` all work on it directly,
+because the worker greenlet genuinely receives that tensor (see
+[Interleaving](#4-interleaving)). To keep a value past the block, mark it with
+`.save()` — and when you're collecting many values, save the *container* and append
+raw reads into it:
 
 ```python
 with model.trace("Hello world"):
-    # Intervention code goes here
-    hidden = model.transformer.h[0].output[0].save()
+    acts = nnsight.save([])
+    for block in model.transformer.h:
+        acts.append(block.output)
+    hidden = nnsight.save(acts[-1])
 ```
 
-The following sections explain how NNsight implements this abstraction, building up to complete deferred remote execution.
+See [Saving values](#61-saving-values) for why the container idiom is the correct
+one and where a bare `.save()` silently drops a value.
 
----
-
-## 2. Tracing
-
-### Overview
-
-In NNsight's deferred execution paradigm, code inside the `with` block should not execute directly. Instead, it must be:
-
-1. **Captured** — The source code is extracted
-2. **Parsed** — The contents of the `with` block are isolated
-3. **Compiled** — The code is transformed into an executable function
-4. **Executed** — The compiled code runs alongside model inference
-
-The `Tracer` class orchestrates this process. When you enter a tracing context, the Tracer captures your intervention code, compiles it into a function, and defers its execution until the model runs.
-
-### 2.1 Capture
-
-When a `Tracer` is instantiated, it calls `.capture()` to locate the source code where the `with` block was entered.
-
-#### Finding the Calling Frame
-
-First, the Tracer uses Python's `inspect` module to walk up the call stack, looking for the first frame that is **not** inside the nnsight library. This is determined by checking whether the frame's filename contains `/nnsight/`. Once the external frame is found, the Tracer must handle several cases for retrieving source code:
-
-#### Case 1: Regular Python Script
-
-This is the base case. The Tracer uses `inspect.getsourcelines(frame)` to retrieve the source code.
-
-**Implementation detail:** NNsight monkey-patches `inspect`'s `checkcache` function to be a no-op. By default, `inspect` checks if source files have changed on disk and reloads them. We want the source lines captured to match what existed when the script was first executed, not any subsequent modifications.
-
-#### Case 2: IPython / Jupyter Notebook
-
-If the code is running in an IPython environment, `inspect.getsourcelines()` won't work because there's no file on disk. Instead, NNsight accesses IPython's interactive history and retrieves the most recent cell, which must contain the trace.
-
-#### Case 3: Nested Traces
-
-When a Tracer is instantiated inside an already-active trace, the parent trace's captured source code is available via an `__nnsight_tracing_info__` object in the parent's local variables. Since the nested trace is a subset of the parent's source, NNsight extracts the relevant lines from there rather than re-capturing.
-
-#### Case 4: Python REPL
-
-When running in the interactive Python REPL (entered by typing `python` at the command line), there is no file and no IPython history. When NNsight is first imported, it detects REPL mode and installs an "NNsight REPL" that tracks entered lines. These tracked lines can then be retrieved when a trace is entered.
-
-*Note: This is the least commonly used mode and has the least defined behavior.*
-
-#### Preparing the Source
-
-Once the source lines are identified, the Tracer determines the base indentation from the first non-blank line and removes it from all lines. This normalization prepares the source for parsing.
-
-### 2.2 Parse
-
-Given the captured source code and the line number where the trace was entered, the `parse` method extracts only the lines **inside** the `with` block.
-
-#### AST Traversal
-
-The source code is passed to Python's `ast` module to build an Abstract Syntax Tree. The Tracer traverses this tree to find the `with` statement on the expected line. Once found, the AST node provides the start and end lines of the block, allowing the intervention code to be extracted.
-
-#### Edge Cases
-
-The parser must handle several syntactic variations:
-
-**Multiple contexts in one `with` statement:**
-```python
-with model.trace("Hello world"), torch.no_grad():
-    # intervention code
-```
-
-**Multi-line `with` statements:**
-```python
-with model.trace(
-    "Hello world"
-):
-    # intervention code
-```
-
-#### Error Handling
-
-If the Tracer cannot locate the `with` block (due to issues with source capture or line number calculation), it reports where it *expected* to find the block along with surrounding context. This diagnostic information helps debug source capture issues.
-
-#### Result
-
-Once parsing completes, a `Tracer.Info` object is created and stored, containing:
-- The intervention source code
-- The true start line number
-- The original frame reference
-
-### 2.3 Compile
-
-With the intervention code captured, the `compile` method transforms it into an executable function.
-
-#### Function Wrapping
-
-The extracted intervention code is wrapped in a function definition:
+There are two ways to change a value, and the distinction matters:
 
 ```python
-def __nnsight_intervention__():
-    # Your intervention code here
-    hidden = model.transformer.h[0].output[0].save()
+with model.trace("Hello world"):
+    # In-place: mutate the tensor currently held by the model.
+    model.transformer.h[0].output[:] = 0
+    # Replacement: hand the model a new tensor.
+    model.transformer.h[0].output = torch.ones_like(model.transformer.h[0].output)
 ```
 
-This function can then be compiled and executed in the appropriate context when the model runs.
+In-place editing works because the base `.output` preprocess returns the live
+tensor and the controller returns whatever the worker left it as; replacement
+works because assigning to the eproperty fires its setter, which issues a swap.
 
-#### Code Transformation
-
-The compilation step also provides an opportunity for the Tracer to:
-- Inject additional setup code
-- Transform certain constructs
-- Add instrumentation for debugging
-- Prepare the code for serialization (for remote execution)
-
----
-
-## 3. Interleaving
-
-### Overview
-
-**Interleaving** is the process of executing the model's forward pass alongside intervention code. The Tracing phase (Section 2) captures and compiles user intervention code into executable functions. Interleaving is where those functions actually run, synchronized with the model's execution.
-
-The key insight is that intervention code and model code must be **coordinated**: intervention code needs to wait for specific values to become available (like a layer's output), and the model needs to pause at the right moments to allow interventions to inspect or modify those values.
-
-NNsight achieves this through a **threading model** with two key classes:
-
-| Class | Role |
-|-------|------|
-| **Interleaver** | Orchestrates the overall interleaving process; runs on the **main thread** alongside the model forward pass |
-| **Mediator** | Represents a single intervention function; runs on a **worker thread** |
-
-The main thread runs the model and provides values at hook points. Worker threads run intervention code and request values. Communication between them creates a strict ping-pong execution pattern where **only one thread runs at a time**, eliminating race conditions.
-
----
-
-### 3.1 The Interleaver
-
-The `Interleaver` class manages the coordination between model execution and all active intervention functions. It:
-
-1. **Wraps modules** with hooks to intercept inputs and outputs
-2. **Manages mediators** — the worker threads running intervention code
-3. **Routes values** from the model to the appropriate mediator(s)
-4. **Handles batching** when multiple invokes share a single forward pass
-
-#### Module Wrapping
-
-When NNsight wraps a model, the Interleaver instruments every module's forward pass with input and output hooks:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Module Forward Pass (wrapped)                          │
-│                                                         │
-│  1. Input Hook fires                                    │
-│     → Interleaver.handle("module.path.input", args)     │
-│     → Mediators can inspect/modify input                │
-│                                                         │
-│  2. Original forward() executes                         │
-│                                                         │
-│  3. Output Hook fires                                   │
-│     → Interleaver.handle("module.path.output", output)  │
-│     → Mediators can inspect/modify output               │
-│                                                         │
-│  4. Return (potentially modified) output                │
-└─────────────────────────────────────────────────────────┘
-```
-
-Each module is identified by its **path** in the model hierarchy (e.g., `model.transformer.h.0.attn`). This path becomes the **provider string** that identifies what value is being provided.
-
-#### Re-wrapping the Same Model
-
-If you wrap the same PyTorch model with `NNsight` or `LanguageModel` multiple times, the interleaver properly handles this by:
-
-1. Detecting that the module's forward method is already wrapped
-2. Removing the old hooks
-3. Applying fresh hooks
+**Know the shape of what you're editing.** A module's `.output` is exactly the object
+its `forward` returns. In current `transformers`, a GPT-2 *block*'s `.output` is a
+plain `Tensor` of shape `[batch, seq, hidden]` — read and write the whole tensor, no
+`[0]` indexing. An *attention* submodule, by contrast, returns a **tuple**
+`(attn_out, ...)`. Don't assume; check with `print(module.source)` (which shows the
+forward and what it returns) or a saved `.shape`:
 
 ```python
-# This is safe:
-model1 = NNsight(my_pytorch_model)
-model2 = NNsight(my_pytorch_model)  # Same underlying model
-
-# Hooks are cleaned up and re-applied, not stacked
-# Only model2's hooks are active
+with model.trace("Hello world"):
+    # Attention fires before its enclosing block returns.
+    attn = model.transformer.h[0].attn.output  # tuple
+    attn_out = attn[0].clone().save()
+    model.transformer.h[0].attn.output[0][:] = 0
+    block = model.transformer.h[0].output  # Tensor [batch, sequence, hidden]
+    model.transformer.h[0].output[:] = 0
 ```
 
-This prevents hooks from stacking up and ensures clean behavior when re-wrapping. The original forward function is preserved and can be restored.
+`.input` gives the module's first forward input (first positional, else first
+keyword); `.inputs` gives the full `(args, kwargs)` pair. Writing `.input` repacks
+correctly into the `(args, kwargs)` the model wants.
 
-#### The `handle()` Method
+**Gotcha — tuple-element views across a barrier can segfault.** Reaching into a
+tuple element and mutating a narrowed view of it across a
+[barrier](#6-features) can crash. The safe move is to assign a modified tensor back
+rather than relying on the in-place edit of a shared view: build the tensor you want
+and set `.output` (or the tuple) to it. Reading `.output` again after an in-place
+edit returns the *modified* value, so `.clone()` first if you need a pre-edit copy.
 
-The `handle()` method is the core of the Interleaver. It is called at every hook point (module input, module output, operation input/output for `.source`). Its job is to:
+Finally, order matters: within one invoke you must read locations in **execution
+order**. Asking for an earlier module's output after a later one has already run
+raises `OutOfOrderError` once the model finishes. To touch modules out of order,
+use separate invokes. Full detail in
+[docs/usage/access-and-modify.md](https://github.com/ndif-team/nnsight/blob/main/docs/usage/access-and-modify.md).
 
-1. Set the current value in the Batcher
-2. Iterate through all mediators, giving each a chance to consume or modify the value
-3. Return the (potentially modified) value to the model
+### 5.4 Source tracing
+
+Module `.input`/`.output` are the only two locations the controller surfaces.
+The individual operations *inside* a `forward` — an activation function, a
+`torch.matmul`, an attention call — are invisible to hooks, because an operation
+isn't a submodule. `.source` makes them observable, editable, and skippable.
+
+`envoy.source` returns a `Source`: the module's `forward` decomposed into its
+operations. Under the hood, the first time you touch `.source` the module's forward
+is AST-instrumented — every call `fn(*args, **kwargs)` is rewritten to run through
+the same interleaver `handle` that modules use, one level finer. The instrumentation
+is lazy and permanent, and completely inert outside a trace, so ordinary inference
+is unaffected. (The mechanism is described in [Source tracing](#54-source-tracing)'s
+companion internals doc; see below.)
+
+You discover operations by printing `.source`, which works outside a trace and shows
+the forward with each op labelled at its call site:
 
 ```python
-def handle(self, provider: str, value: Any, iterate: bool = False):
-    # Store original value
-    self.batcher.current_value = value
-    
-    # Let each mediator process this provider
-    for mediator in self.mediators:
-        self.current = mediator
-        
-        if iterate:
-            provider = self.iterate_provider(original_provider)  # e.g., "module.output.i0"
-        
-        mediator.handle(provider)
-        
-        if iterate and mediator.alive:
-            mediator.iteration_tracker[original_provider] += 1
-    
-    # Return potentially modified value
-    return self.batcher.current_value
+print(model.transformer.h[0].mlp.source)
 ```
 
-#### Iteration Tracking
+```
+                    * def forward(self, hidden_states: ...) -> torch.FloatTensor:
+ self_c_fc_0    ->  0     hidden_states = self.c_fc(hidden_states)
+ self_act_0     ->  1     hidden_states = self.act(hidden_states)
+ self_c_proj_0  ->  2     hidden_states = self.c_proj(hidden_states)
+ self_dropout_0 ->  3     hidden_states = self.dropout(hidden_states)
+                    4     return hidden_states
+```
 
-When a module is called multiple times (common in multi-token generation), the same provider string would match multiple times. To disambiguate, the Interleaver appends an **iteration suffix**:
+Operation names are the **full dotted callee joined with `_`**, plus a per-name
+occurrence index in execution order: `self.c_fc(...)` → `self_c_fc_0`,
+`torch.relu(...)` → `torch_relu_0`, a bare `dropout(...)` → `dropout_0`. Nested calls
+run inner-first, so `f(f(x))` numbers the inner `f` as `f_0`. You rarely memorize
+names — `print(module.source)` is the map, and a wrong name raises an
+`AttributeError` listing the available ops.
 
-| Call | Provider String |
-|------|-----------------|
-| 1st call to layer 0 | `model.transformer.h.0.output.i0` |
-| 2nd call to layer 0 | `model.transformer.h.0.output.i1` |
-| 3rd call to layer 0 | `model.transformer.h.0.output.i2` |
-
-The Interleaver tracks how many times each provider has been seen via `iterate_provider()`. The Mediator tracks which iteration it's requesting via `iterate_requester()`.
-
-#### Context Manager Protocol
-
-The Interleaver uses Python's context manager protocol to manage the interleaving lifecycle:
+Inside a trace, each operation exposes the same handles a module does:
 
 ```python
-with interleaver:
-    # 1. __enter__: Start all mediator worker threads
-    # 2. Model forward pass runs here, calling handle() at each hook
-    # 3. __exit__: Clean up completed mediators
-    model(*args, **kwargs)
+with model.trace("Hello world"):
+    act = model.transformer.h[0].mlp.source.self_act_0.output.save()  # read
+    model.transformer.h[0].mlp.source.self_c_proj_0.output[:] = 0     # edit
 ```
 
----
+Two classes back this. `Source` is the whole-forward view (`envoy.source`); indexing
+it by an op name yields a `SourceEnvoy`, the single-operation view. A `SourceEnvoy`
+is the operation-level analogue of an `Envoy`: its `.output`, `.input`, and
+`.inputs` are the *same* eproperties ([§5.2](#52-eproperties-how-values-are-hooked)),
+keyed on the op's path, and it has its own `.skip(replacement)`.
 
-### 3.2 The Mediator
-
-The `Mediator` class represents a single intervention function and handles communication with the Interleaver. Each `invoke` block in user code becomes one Mediator.
-
-#### Threading Model
-
-Each Mediator runs its intervention code in a **worker thread**. The main thread (running the model) and worker threads communicate via two single-item queues:
-
-| Queue | Direction | Purpose |
-|-------|-----------|---------|
-| `event_queue` | Worker → Main | Mediator sends requests (VALUE, SWAP, END, etc.) |
-| `response_queue` | Main → Worker | Interleaver sends responses (values, errors) |
-
-These queues use locks to block until an item is available, creating a **ping-pong** execution pattern:
-
-```
-Main Thread (Model)              Worker Thread (Intervention)
-─────────────────────            ────────────────────────────
-                                 Start intervention code
-                                 ...
-                                 Request layer.output
-                                 → event_queue.put(VALUE, "layer.output")
-                                 → response_queue.wait() [BLOCKED]
-
-Module hook fires
-← event_queue.wait() returns
-Check: provider == requester? ✓
-→ response_queue.put(value)
-→ event_queue.wait() [BLOCKED]
-
-                                 ← response_queue.wait() returns
-                                 Received value, continue execution
-                                 ...
-                                 Request another value
-                                 → event_queue.put(...)
-                                 [cycle repeats]
-```
-
-**Key property:** Only one thread runs at a time. This eliminates race conditions without explicit locking of data structures.
-
-#### Event Types
-
-The Mediator communicates with the Interleaver through events:
-
-| Event | Description |
-|-------|-------------|
-| `VALUE` | Request a value from a provider (e.g., `layer.output`) |
-| `SWAP` | Replace a provider's value with a new value |
-| `SKIP` | Skip a module's execution entirely |
-| `BARRIER` | Synchronization point (for advanced use) |
-| `END` | Signal that intervention is complete |
-| `EXCEPTION` | An error occurred in the intervention |
-
-#### Provider/Requester Matching
-
-When intervention code accesses `model.layer.output`, it generates a **requester string** like `model.layer.output.i0`. When the model's hook fires for that layer, it generates a **provider string**.
-
-The Mediator's `handle()` method checks if they match:
-
-- **Match:** Deliver the value to the worker thread
-- **No match, requester not in history:** Store provider in history, restore event for later
-- **No match, requester in history:** The module already ran → **OutOfOrderError**
+**Recursive `.source`** drills into the function an operation *calls*, exposing its
+operations one level deeper — and works **only inside a trace**, because the call
+target (often a local, like an attention implementation) is resolved from the live
+value flowing through the call:
 
 ```python
-def handle_value_event(self, requester, provider):
-    if provider == requester:
-        # Match! Deliver the value
-        value = self.interleaver.batcher.narrow(self.batch_group)
-        self.respond(value)
-        return True  # Continue processing
-    else:
-        if requester in self.history:
-            # Already saw this provider - out of order!
-            self.respond(OutOfOrderError(...))
-        else:
-            # Haven't seen requester yet - store and wait
-            self.history.add(provider)
-            self.event_queue.restore((Events.VALUE, requester))
-            return False  # Stop processing, wait for next provider
+with model.trace("Hello world"):
+    attn  = model.transformer.h[0].attn.source
+    inner = attn.attention_interface_1.source            # drill into the call (_0 is the assignment choosing it)
+    scores = inner.attn_output_transpose_0.output.save() # an op inside it
 ```
 
-#### History and Out-of-Order Detection
+Drilling into a call that is itself a *submodule* is refused (call `.source` on that
+submodule directly); so are builtins/C functions, closures, and decorated forwards
+— all raise `SourceNotAvailable`. See [docs/usage/source.md](https://github.com/ndif-team/nnsight/blob/main/docs/usage/source.md)
+and [docs/developing/source-internals.md](https://github.com/ndif-team/nnsight/blob/main/docs/developing/source-internals.md), and
+`src/nnsight/intervention/source.py`.
 
-The `history` set tracks which providers have been seen during this interleaving session. This enables detection of out-of-order access:
+### 5.5 Skipping a module
+
+`module.skip(replacement)` tells the interleaver: when the model is about to run
+this module, **don't** — use `replacement` as its output instead. The forward body
+never runs; `replacement` flows on in its place. It is the tool for ablating a
+module, routing around a layer, or splicing in a reconstructed activation (an SAE
+output, say):
 
 ```python
-with model.trace("Hello"):
-    # CORRECT: Access in execution order
-    layer0_out = model.transformer.h[0].output.save()  # Waits for layer 0
-    layer5_out = model.transformer.h[5].output.save()  # Waits for layer 5
-
-with model.trace("Hello"):
-    # ERROR: Out of order access
-    layer5_out = model.transformer.h[5].output.save()  # Waits for layer 5
-    layer0_out = model.transformer.h[0].output.save()  # Layer 0 already passed!
-    # → OutOfOrderError: "Value was missed for model.transformer.h.0.output.i0"
+with model.trace("Hello world"):
+    # Pass layer 0's input straight through as its output (a residual bypass).
+    model.transformer.h[0].skip(model.transformer.h[0].input)
+    output = model.output.save()
 ```
 
-When the worker requests layer 0's output *after* layer 5's, the history already contains `model.transformer.h.0.output.i0`, so the Mediator knows it's too late.
+The skip gate is offered *before* the module's input is read, so reading the
+module's own `.input` and handing it back as the replacement — the pass-through
+above — works on the very first trace. The replacement must match the shape the
+module would normally return (a plain tensor for a GPT-2 block, a tuple for an
+attention submodule). Source operations expose the same `.skip(replacement)`.
 
-#### Batching
+Skip shares the per-module controller with [source tracing](#54-source-tracing), and
+the two compose on one wrapper. For the full mechanics — how skip and early
+stopping relate, batched skips that must cover every row, and persistent skips via
+`edit(inplace=True)` — see [Skipping and early stopping](#65-skipping-and-early-stopping)
+and [docs/usage/skip.md](https://github.com/ndif-team/nnsight/blob/main/docs/usage/skip.md).
 
-When multiple invokes are defined, their inputs are batched together into a single forward pass for efficiency. Each Mediator is assigned a **batch group** that specifies which slice of the batch it operates on.
+### 5.6 Aliasing modules (rename)
+
+Different architectures name the same role differently — `transformer.h` here,
+`model.layers` there, `gpt_neox.layers` elsewhere. The `rename={...}` constructor
+argument installs **aliases** so your intervention code reads the same across
+families. An alias is an ordinary attribute pointing at the *same* child envoy
+object — not a copy — so the original path keeps working, iteration doesn't
+double-count, and the alias survives a [dispatch](#57-dispatch-and-update) re-point
+with no rebuild.
+
+The key shape decides where an alias binds, and every resolving envoy in the tree
+runs the binding:
+
+- A **single-component key** (`"mlp"`) binds wherever it resolves — *every* block
+  that has an `mlp` child gets the alias.
+- A **dotted key** (`"transformer.h"`) mounts that subtree on the **root** envoy
+  under the alias name.
+- A **leading-dot key** (`".h"`) binds relative to *each* envoy — the alias lands on
+  whichever envoy actually has that child (e.g. `model.transformer.layers`, not
+  `model.layers`).
+
+A value may be one alias or a list of them:
 
 ```python
-with model.trace() as tracer:
-    with tracer.invoke("Hello"):      # batch_group = [0, 1]  → indices 0:1
-        out1 = model.output.save()
-    
-    with tracer.invoke("World"):      # batch_group = [1, 1]  → indices 1:2
-        out2 = model.output.save()
-```
-
-The `Batcher` class handles slicing:
-
-| Method | Description |
-|--------|-------------|
-| `narrow(batch_group)` | Extract this mediator's slice from the full batch |
-| `swap(batch_group, value)` | Replace this mediator's slice in the full batch |
-
-```python
-# In Batcher.narrow():
-def narrow(self, batch_group):
-    batch_start, batch_size = batch_group
-    
-    def _narrow(tensor):
-        if tensor.shape[0] == self.total_batch_size:
-            return tensor.narrow(0, batch_start, batch_size)
-        return tensor
-    
-    return apply(self.current_value, _narrow, torch.Tensor)
-```
-
-This means each Mediator sees only its own inputs/outputs, even though they're processed together in one forward pass.
-
-#### Cross-Invoker Variable Sharing
-
-A powerful feature of NNsight is the ability to reference values from one invoke in another:
-
-```python
-with model.trace() as tracer:
-    with tracer.invoke("The Eiffel Tower is in"):
-        embeddings = model.transformer.wte.output  # Save this
-    
-    with tracer.invoke("_ _ _ _ _ _"):
-        model.transformer.wte.output = embeddings  # Use it here!
-```
-
-Since each invoke runs in a separate thread, variables must be **shared** between them. The Mediator handles this with `push()` and `pull()`:
-
-- **`push()`**: Copy local variables from the worker thread's frame to a shared location
-- **`pull()`**: Copy variables from the shared location into the current worker thread's frame
-
-This happens automatically before each event is sent (`send()` calls `push()` then `pull()` after receiving response).
-
-**Configuration:** Cross-invoker sharing has some performance cost. It can be disabled:
-
-```python
-from nnsight import CONFIG
-CONFIG.APP.CROSS_INVOKER = False  # Disable cross-invoker variable sharing
-```
-
-When disabled, you cannot reference variables from other invokes.
-
-#### Barrier Synchronization
-
-Cross-invoker variable sharing works when the first invoke completes before the second invoke needs the variable. But what if **both invokes access the same module**? Since invokes run serially, the second invoke would start after the first completes — but if they both need to access `model.transformer.wte.output`, you need them synchronized at that point.
-
-This is what `tracer.barrier()` solves:
-
-```python
-with llm.trace() as tracer:
-    
-    barrier = tracer.barrier(2)  # Create barrier for 2 participants
-    
-    # First invoke: capture embeddings from "Paris" prompt
-    with tracer.invoke("The Eiffel Tower is in"):
-        paris_embeddings = llm.transformer.wte.output
-        barrier()  # Wait here until both invokes reach this point
-    
-    # Second invoke: patch those embeddings into a different prompt!
-    with tracer.invoke("_ _ _ _ _"):  # Dummy tokens (same length)
-        barrier()  # Synchronize with first invoke
-        llm.transformer.wte.output = paris_embeddings  # Now paris_embeddings is available!
-        patched_output = llm.lm_head.output[:, -1].save()
-```
-
-Without the barrier, the second invoke would fail with `paris_embeddings is not defined` because:
-1. Both invokes access `wte.output`
-2. Invokes normally run serially (first completes, then second starts)
-3. By the time the second invoke runs, `wte.output` has already been provided in the first invoke's pass
-
-The barrier synchronizes the two invokes at a specific point, allowing them to share variables while both are accessing the same module.
-
-**How barriers work:**
-1. `tracer.barrier(n)` creates a barrier that waits for `n` participants
-2. When a mediator calls `barrier()`, it pauses and waits
-3. Once all `n` participants have called `barrier()`, they all resume together
-4. Variables pushed by earlier invokes are now available to later invokes
-
-#### Lifecycle
-
-A Mediator's lifecycle:
-
-1. **Creation**: Mediator is created with the compiled intervention function
-2. **Start**: `mediator.start(interleaver)` spawns the worker thread
-3. **Execution**: Worker thread runs intervention code, communicating via queues
-4. **Completion**: Worker reaches end of intervention → sends `END` event
-5. **Cleanup**: `mediator.cancel()` clears ephemeral state
-
----
-
-## 4. Envoy
-
-### Overview
-
-The `Envoy` class is the user-facing interface for interacting with model modules. It wraps a `torch.nn.Module` and provides:
-
-1. **Value access** — `.output`, `.input`, `.inputs` properties to get module activations
-2. **Source tracing** — `.source` to access intermediate operations within a forward pass
-3. **Transparent delegation** — Attribute access falls through to the underlying module
-4. **Tracing integration** — Methods can be used as tracing contexts
-
-**Key insight:** When users write `model.transformer.h[0]`, they're accessing an Envoy, not the actual PyTorch module. The Envoy is a proxy that looks and feels like the module but adds NNsight's intervention capabilities.
-
-```python
-model = LanguageModel("gpt2")
-
-# model.transformer is an Envoy wrapping the actual GPT2Model
-# model.transformer.h[0] is an Envoy wrapping the first GPT2Block
-# model.transformer.h[0].attn is an Envoy wrapping the attention module
-```
-
----
-
-### 4.1 The Envoy Tree
-
-When NNsight wraps a model, it creates a **parallel tree of Envoys** that mirrors the module hierarchy:
-
-```
-PyTorch Module Tree              Envoy Tree
-────────────────────             ──────────
-GPT2LMHeadModel                  Envoy (path="model")
-├── transformer (GPT2Model)      ├── Envoy (path="model.transformer")
-│   ├── wte (Embedding)          │   ├── Envoy (path="model.transformer.wte")
-│   ├── h (ModuleList)           │   ├── Envoy (path="model.transformer.h")
-│   │   ├── [0] (GPT2Block)      │   │   ├── Envoy (path="model.transformer.h.0")
-│   │   │   ├── attn             │   │   │   ├── Envoy (path="model.transformer.h.0.attn")
-│   │   │   └── mlp              │   │   │   └── Envoy (path="model.transformer.h.0.mlp")
-│   │   └── ...                  │   │   └── ...
-└── lm_head (Linear)             └── Envoy (path="model.lm_head")
-```
-
-#### Tree Construction
-
-The Envoy tree is built **eagerly** in `__init__`:
-
-```python
-def __init__(self, module, interleaver=None, path="model", rename=None):
-    self.path = path
-    self._module = module
-    self._module.__path__ = path  # Store path on module for hooks
-    
-    self._interleaver = interleaver if interleaver else Interleaver()
-    self._interleaver.wrap_module(module)  # Install hooks
-    
-    self._children = []
-    
-    # Eagerly create Envoys for all children
-    for name, child_module in self._module.named_children():
-        setattr(self, name, child_module)  # Triggers _add_envoy via __setattr__
-```
-
-When `setattr(self, name, module)` is called with a `torch.nn.Module`, `__setattr__` intercepts it and calls `_add_envoy()`:
-
-```python
-def __setattr__(self, key, value):
-    if key != "_module" and isinstance(value, torch.nn.Module):
-        self._add_envoy(value, key)
-    else:
-        super().__setattr__(key, value)
-
-def _add_envoy(self, module, name):
-    module_path = f"{self.path}.{name}"
-    
-    envoy = Envoy(
-        module,
-        path=module_path,
-        interleaver=self._interleaver,
-        rename=self._alias.rename if self._alias else None,
-    )
-    
-    self._children.append(envoy)
-    super().__setattr__(name, envoy)
-    
-    return envoy
-```
-
-#### The Path Attribute
-
-Every Envoy has a `path` string (e.g., `"model.transformer.h.0.attn"`). This path:
-
-- Is stored on both the Envoy (`self.path`) and the underlying module (`module.__path__`)
-- Becomes the **provider string** root during interleaving
-- Is used to construct provider strings like `"model.transformer.h.0.attn.output.i0"`
-
-#### Dynamic Module Access
-
-If a module is added to the model after Envoy construction, or accessed in an unusual way, `__getattr__` handles it:
-
-```python
-def __getattr__(self, name):
-    # Check aliases first
-    if self._alias and name in self._alias.alias_to_name:
-        return util.fetch_attr(self, self._alias.alias_to_name[name])
-    
-    if hasattr(self._module, name):
-        value = getattr(self._module, name)
-        
-        if isinstance(value, torch.nn.Module):
-            # Dynamically create Envoy for newly discovered module
-            return self._add_envoy(value, name)
-        # ... handle methods and other attributes
-```
-
----
-
-### 4.2 Accessing Values
-
-The core intervention interface consists of three properties:
-
-| Property | Returns | Description |
-|----------|---------|-------------|
-| `.output` | Module's output | The return value of the module's forward pass |
-| `.input` | First input | The first positional argument (or first kwarg if no positional args) |
-| `.inputs` | `(args, kwargs)` | All inputs as a tuple of `(tuple, dict)` |
-
-#### How Value Access Works
-
-When you access `.output` inside a trace:
-
-```python
-with model.trace("Hello"):
-    hidden = model.transformer.h[0].output  # What happens here?
-```
-
-The `.output` property:
-
-1. Checks if currently interleaving
-2. Constructs the requester string: `"model.transformer.h.0.output"`
-3. Calls `self._interleaver.current.request(requester)` 
-4. The current Mediator sends a `VALUE` event and **blocks** until the value is provided
-5. Returns the value when the model's hook provides it
-
-```python
-@property
-def output(self):
-    if self.interleaving:
-        return self._interleaver.current.request(
-            self._interleaver.iterate_requester(f"{self.path}.output")
-        )
-    elif self._fake_output is not inspect._empty:
-        return self._fake_output
-    else:
-        raise ValueError("Cannot return output outside of trace")
-```
-
-#### Setting Values
-
-You can also **set** values to modify activations:
-
-```python
-with model.trace("Hello"):
-    model.transformer.h[0].output[0][:] = 0  # Zero out activations
-```
-
-The `.output` setter:
-
-1. Constructs the requester string
-2. Calls `self._interleaver.current.swap(requester, value)`
-3. The Mediator sends a `SWAP` event
-4. The Interleaver's Batcher replaces the value
-
-```python
-@output.setter
-def output(self, value):
-    if self.interleaving:
-        self._interleaver.current.swap(
-            self._interleaver.iterate_requester(f"{self.path}.output"), value
-        )
-    else:
-        raise ValueError("Cannot set output outside of trace")
-```
-
-#### Fake Values for Scanning
-
-When using `.scan()` (shape inference without full execution), fake inputs/outputs are populated:
-
-```python
-with model.scan("Hello"):
-    # Runs with fake tensors, populates _fake_output
-    shape = model.transformer.h[0].output[0].shape
-
-# After scanning, can access outside trace
-print(model.transformer.h[0]._fake_output.shape)
-```
-
-The `_fake_output` and `_fake_inputs` attributes store these fake values, allowing access outside a trace after scanning.
-
----
-
-### 4.3 Source Tracing
-
-The `.source` property enables access to **intermediate operations** inside a module's forward pass, not just its inputs and outputs.
-
-#### The Problem
-
-Normally, you can only hook at module boundaries:
-
-```python
-# Can access layer output (module boundary)
-model.transformer.h[0].output
-
-# Cannot access intermediate computation like attention scores
-# (unless the model explicitly exposes them)
-```
-
-#### The Solution: Forward Rewriting
-
-When you access `.source`, NNsight:
-
-1. **Parses** the module's forward method using AST
-2. **Wraps** every function/method call with `interleaver.wrap_operation()`
-3. **Replaces** the module's forward with the instrumented version
-4. **Creates** an `EnvoySource` with `OperationEnvoy` objects for each operation
-
-```python
-@property
-def source(self):
-    if self._source is None:
-        # inject() parses forward method and wraps operations
-        source, line_numbers, forward = inject(
-            self._module.forward, 
-            wrap_function,  # Wraps each operation
-            self._module.__path__
-        )
-        
-        # Replace forward with instrumented version
-        self._module.forward = MethodType(forward, self._module)
-        
-        # Create EnvoySource with all operations
-        self._source = EnvoySource(
-            self._module.__path__,
-            source,
-            line_numbers,
-            interleaver=self._interleaver,
-        )
-    
-    return self._source
-```
-
-#### Using Source Tracing
-
-First, print `.source` to discover available operations:
-
-```python
-print(model.transformer.h[0].attn.source)
-
-# Output shows operation names and line numbers:
-#   attention_interface_0  -> 66  attn_output, attn_weights = attention_interface(...)
-#   self_c_proj_0          -> 79  attn_output = self.c_proj(attn_output)
-#   self_resid_dropout_0   -> 80  attn_output = self.resid_dropout(attn_output)
-```
-
-Then access operations by name:
-
-```python
-with model.trace("Hello"):
-    # Access attention computation output
-    attn_out = model.transformer.h[0].attn.source.attention_interface_0.output.save()
-    
-    # Access projection input/output
-    proj_in = model.transformer.h[0].attn.source.self_c_proj_0.input.save()
-```
-
-#### OperationEnvoy
-
-Each operation gets an `OperationEnvoy` with the same interface as `Envoy`:
-
-| Property | Description |
-|----------|-------------|
-| `.output` | The operation's return value |
-| `.input` | The first positional argument |
-| `.inputs` | All arguments as `(args, kwargs)` |
-| `.source` | Recursive tracing into nested calls |
-
-#### Recursive Source Tracing
-
-You can trace into nested function calls:
-
-```python
-# Trace into the attention_interface function itself
-model.transformer.h[0].attn.source.attention_interface_0.source.some_inner_op.output
-```
-
----
-
-### 4.4 Method Delegation and Tracing
-
-The Envoy transparently delegates attribute access to the underlying module, but with special handling for methods.
-
-#### Transparent Access
-
-Non-method attributes are returned directly:
-
-```python
-model.transformer.h[0].attn.num_heads  # Returns the actual value from the module
-```
-
-#### Method Wrapping for Tracing
-
-When accessing a method, the Envoy wraps it to enable tracing:
-
-```python
-def __getattr__(self, name):
-    if hasattr(self._module, name):
-        value = getattr(self._module, name)
-        
-        if isinstance(value, (FunctionType, MethodType, ...)):
-            # Wrap in trace-enabling function
-            def trace(*args, **kwargs):
-                try:
-                    return self.trace(*args, fn=value, **kwargs)
-                except WithBlockNotFoundError:
-                    # Not in a with block, call normally
-                    return value(*args, **kwargs)
-            
-            return trace
-```
-
-This enables calling module methods as trace contexts:
-
-```python
-# model.generate is a method on the underlying module
-# But Envoy wraps it so it can be used as a trace context
-with model.generate("Hello", max_new_tokens=10) as tracer:
-    output = model.generator.output.save()
-```
-
-If the method is called **without** a `with` block, it falls back to the normal method call:
-
-```python
-# No with block - just calls the method directly
-output = model.generate("Hello", max_new_tokens=10)
-```
-
-The `WithBlockNotFoundError` is raised when the Tracer cannot find a `with` block in the source (see Section 2.2), triggering the fallback.
-
----
-
-### 4.5 Aliasing
-
-The `Aliaser` class enables renaming modules to provide a consistent interface across different model architectures.
-
-#### The Problem
-
-Different models have different module structures:
-
-```python
-# GPT-2
-model.transformer.h[0].attn
-
-# LLaMA
-model.model.layers[0].self_attn
-```
-
-#### The Solution
-
-The `rename` parameter creates aliases:
-
-```python
-model = LanguageModel(
-    "gpt2",
+model = TransformersModel(
+    "openai-community/gpt2", task="text-generation",
+    dispatch=True,
     rename={
-        ".transformer.h": ".layers",       # Mount to root
-        ".transformer.wte": ".embed",
-    }
+        "transformer.h": "layers",           # subtree mounted on the root
+        "mlp": "my_mlp",                      # every block's mlp aliased
+        "transformer": ["mdl", "backbone"],  # two aliases for one path
+    },
 )
 
-# Now both work:
-model.transformer.h[0]  # Original path
-model.layers[0]         # Alias
+with model.trace("Hello world"):
+    a = model.layers[0].my_mlp.output.save()     # via aliases
+    b = model.transformer.h[0].mlp.output.save() # original still works
+    c = model.mdl.h[0].output.save()             # via the first alias
 ```
 
-#### Alias Types
+Pass `rename=` at construction — aliases bind during `Envoy.__init__`; there is no
+post-hoc API. Avoid alias names that collide with existing `Envoy` attributes
+(`output`, `input`, `trace`). See
+[docs/usage/rename-modules.md](https://github.com/ndif-team/nnsight/blob/main/docs/usage/rename-modules.md).
 
-| Pattern | Description | Example |
-|---------|-------------|---------|
-| Simple rename | One name to another | `{"layer1": "first_layer"}` |
-| Path mounting | Deep path to root | `{".model.layers": ".layers"}` |
-| Multiple aliases | One path, many names | `{".transformer": ["model", "mdl"]}` |
+### 5.7 Dispatch and update
 
-#### Implementation
+Model wrappers build in two phases. When you construct `TransformersModel("...")`
+without `dispatch=True`, nnsight builds the model's **structure on the meta device**
+— every module is created, shapes and dtypes are known, but no weights are loaded
+and nothing sits in memory. The envoy tree is built over this weightless skeleton,
+so you can inspect it, print `.source`, and set up `rename`/`envoys` immediately.
 
-The `Aliaser` maintains bidirectional mappings:
+The real weights are loaded on demand. `.dispatch()` — triggered automatically on
+the first real (non-scan) interleave, or callable directly to load eagerly — loads
+the weights via the wrapper's `_load` and hands the new module to `_update`, which
+**re-points the existing envoy tree** at it in place. `_update` walks the tree by
+name, swapping each envoy's `._module` for the real one and re-instrumenting it (the
+new module gets its own controller; the meta module's doesn't carry over).
+Passing a ready `nn.Module`, or `dispatch=True`, skips the meta phase and loads
+eagerly.
+
+Because `_update` re-points the *same* envoy objects rather than rebuilding the
+tree, everything that referenced them stays valid: **aliases survive dispatch** (they
+point at the same child objects `_update` re-points), and standalone children added
+to the tree that aren't part of the loaded module — `TransformersModel`'s
+`generator`, for instance — are left in place, keeping their own module and controller.
+This is why `rename=` and `envoys=` are threaded to the envoy but kept out of the
+replayed load arguments: the tree carries them across the swap for free. See
+`src/nnsight/modeling/mixins/meta.py`.
+
+### 5.8 Ad-hoc module calls
+
+Inside a trace you can *call* any attached module directly, feeding it whatever input
+you like, to compute with it out of its place in the forward pass. The canonical use
+is the logit lens — running `lm_head` on an intermediate hidden state:
 
 ```python
-class Aliaser:
-    def __init__(self, rename):
-        self.rename = rename
-        self.alias_to_name = {}     # alias -> original
-        self.name_to_aliases = {}   # original -> [aliases]
-    
-    def build(self, envoy):
-        for name, aliases in self.rename.items():
-            # ... build mappings
-            for alias in aliases:
-                self.alias_to_name[alias] = name
+with model.trace("The Eiffel Tower is in the city of"):
+    hidden = model.transformer.h[-1].output
+    logits = model.lm_head(model.transformer.ln_f(hidden))
+    tok = logits[0, -1].argmax(-1).save()
+# model.tokenizer.decode(tok) -> ' Paris'
 ```
 
-When `__getattr__` is called with an alias, it resolves to the original:
+By default, while interleaving, `envoy(...)` calls `module.forward(...)` **directly**,
+skipping PyTorch's hook dispatch. That is deliberate: it keeps the ad-hoc call from
+re-entering the controller's handoff (which would try to switch into the very worker
+making the call) and leaves the module's real place in the forward pass untouched.
+Outside a trace it's just an ordinary module call.
+
+Pass `hook=True` to force the full `module(...)` path so the module's own hooks *do*
+fire and its submodules become addressable at `.submodule.output`. Use it for a
+module you've **attached** to the tree that isn't part of the real forward — an
+adapter, LoRA, or SAE applied in an [edit](#6-features) — so its internals become
+observable:
 
 ```python
-def __getattr__(self, name):
-    if self._alias and name in self._alias.alias_to_name:
-        return util.fetch_attr(self, self._alias.alias_to_name[name])
-```
-
----
-
-### 4.6 Handling Conflicts
-
-Some models have modules named `input` or `output`, which conflict with Envoy's properties.
-
-#### The Problem
-
-```python
-# Hypothetical model with a module named "output"
-class MyModel(nn.Module):
+class MyAdapter(torch.nn.Module):
     def __init__(self):
-        self.output = nn.Linear(100, 10)  # Conflicts with Envoy.output!
+        super().__init__()
+        self.inner = torch.nn.Identity()
+
+    def forward(self, hidden):
+        return self.inner(hidden)
+
+model.transformer.h[0].adapter = MyAdapter()
+with model.edit() as (tracer, edited):
+    acts = edited.transformer.h[0].output
+    edited.transformer.h[0].output[:] = edited.transformer.h[0].adapter(acts, hook=True)
+
+with edited.trace("Hello world"):
+    inner = edited.transformer.h[0].adapter.inner.output.save()
 ```
 
-#### The Solution
+Applying the attached module inside an `edit` runs it on every trace; to apply it on
+*every step* of a generation loop, put the passthrough under the edit tracer's
+`iter`. See [Extending nnsight](#10-extending-nnsight).
 
-When a conflict is detected, the Envoy property is mounted at `nns_<name>` instead:
+### 5.9 Navigating the tree
 
-```python
-def _handle_overloaded_mount(self, envoy, mount_point):
-    warnings.warn(
-        f"Module has pre-defined `{mount_point}` attribute. "
-        f"nnsight access mounted at `.nns_{mount_point}` instead."
-    )
-    
-    # Create new class with remapped property
-    new_cls = type(f"{self.__class__.__name__}.Preserved", (self.__class__,), {})
-    
-    # Move Envoy property to nns_<name>
-    mount = getattr(Envoy, mount_point)
-    setattr(new_cls, f"nns_{mount_point}", mount)
-    
-    # Store the child envoy at the original name
-    self.__dict__[mount_point] = envoy
-```
+Beyond attribute access, an envoy offers programmatic ways to walk and address the
+tree:
 
-Now:
-- `model.output` → The child module's Envoy (as expected)
-- `model.nns_output` → The Envoy property for getting module outputs
-
----
-
-### 4.7 Dispatching and Updates
-
-For large models, NNsight supports **lazy loading** with `dispatch=True`. The Envoy tree must be updated when the real weights are loaded.
-
-#### The Problem
-
-With dispatching:
-1. Model is initially loaded with meta/empty tensors (fast, low memory)
-2. Envoy tree is created around these placeholder modules
-3. Real weights are loaded later
-4. Envoy tree must now point to the real modules
-
-#### The Solution
-
-The `_update()` method recursively updates the Envoy tree:
+- **`.modules(include_fn=None, names=False)`** flattens the whole subtree (children
+  first, then self) into a list, optionally filtered by a predicate; with
+  `names=True` it yields `(path, envoy)` tuples. `.named_modules()` is the same with
+  names on.
+- **Iteration** — `for block in model.transformer.h:` yields *direct* children in
+  order (not recursive); `model.transformer.h[0]` indexes them, and `len(envoy)`
+  gives a `ModuleList`'s length.
+- **`.get(path)`** resolves a dotted path from an envoy — `model.get("transformer.h.0.mlp")`
+  — which is the programmatic alternative to attribute access when the path is built
+  at runtime. Outside a trace it returns the descendant envoy; inside one, a trailing
+  `.output`/`.input` resolves through to the live value.
+- **`.path`** is the envoy's dotted location (`"model.transformer.h.0.mlp"`), the
+  string every interleaver location is derived from.
+- **`._module`** is the wrapped `torch.nn.Module` — the escape hatch to real
+  parameters, `state_dict`, class, and so on.
+- **`.device`** is the device of the module's first parameter (or `None` if it has
+  none); `.devices` is the set of devices its parameters live on. `.to()`, `.cpu()`,
+  `.cuda()` move the wrapped module in place and return the envoy for chaining.
 
 ```python
-def _update(self, module):
-    # Update children recursively
-    for i, child in enumerate(module.children()):
-        self._children[i]._update(child)
-    
-    # Update this Envoy's module reference
-    self._module = module
-    self._module.__path__ = self.path
-    
-    # Re-wrap with hooks
-    self._interleaver.wrap_module(module)
-    
-    # Re-inject source if it was accessed
-    if self._source is not None:
-        # Re-inject the forward method
-        source, line_numbers, forward = inject(...)
-        self._module.forward = MethodType(forward, self._module)
-```
-
-This is called automatically when the model is dispatched, ensuring the Envoy tree stays synchronized with the actual modules.
-
----
-
-### 4.8 Ad-hoc Module Calls
-
-Inside a trace, you can call modules directly on intermediate values. This is essential for techniques like **logit lens**.
-
-```python
-with model.trace(prompt) as tracer:
-    # Get intermediate hidden states
-    hidden_states = model.transformer.h[-1].output[0]
-    
-    # Apply ln_f and lm_head to decode hidden states
-    logits = model.lm_head(model.transformer.ln_f(hidden_states)).save()
-```
-
-#### How It Works: Bypassing Hooks
-
-When you call an Envoy inside a trace, it **bypasses interleaving hooks** by default:
-
-```python
-def __call__(self, *args, hook: bool = False, **kwargs):
-    return (
-        self._module.forward(*args, **kwargs)  # Bypasses hooks
-        if self.interleaving and not hook
-        else self._module(*args, **kwargs)
-    )
-```
-
-The key is using `.forward()` instead of `__call__()`. This means when you call `model.lm_head(hidden_states)`, it doesn't trigger `.input` or `.output` hooks on `lm_head` - you're just applying the module's computation to your tensor.
-
-#### When to Use `hook=True`
-
-Set `hook=True` when you have **auxiliary modules** added to the model that aren't part of its normal forward pass. Examples include:
-
-- **Sparse Autoencoders (SAEs)**
-- **LoRA adapters**
-- **Transcoders**
-
-```python
-# Assume model.sae is an auxiliary SAE module you've added
-with model.trace() as tracer:
-    # First invoke: apply the SAE with hooks enabled
-    with tracer.invoke("Hello"):
-        hidden = model.transformer.h[5].output[0]
-        # Use hook=True so we can access .input/.output on the SAE later
-        reconstructed = model.sae(hidden, hook=True)
-        model.transformer.h[5].output[0] = reconstructed
-    
-    # Second invoke: access the SAE's activations
-    with tracer.invoke("Hello"):
-        sae_activations = model.sae.output.save()  # Works because we used hook=True
-```
-
-With `hook=True`, the auxiliary module participates in interleaving, allowing you to access its `.input` and `.output` in other invokes.
-
----
-
-### 4.9 Device Utilities
-
-Envoys provide device inspection and movement methods:
-
-```python
-# Get the device of the first parameter
-device = model.device  # e.g., torch.device('cuda:0')
-
-# Get all devices (for models spread across multiple GPUs)
-devices = model.devices  # e.g., {torch.device('cuda:0'), torch.device('cuda:1')}
-
-# Move the module to a specific device
-model.to(torch.device('cuda:1'))
-model.cpu()
-model.cuda()
-```
-
-These pass through to the underlying PyTorch module.
-
----
-
-### 4.10 Envoy Tree Navigation
-
-#### Iterating Over Modules
-
-Use `.modules()` and `.named_modules()` to iterate over all Envoys in the tree:
-
-```python
-# Get all Envoys
-all_envoys = model.modules()
-
-# Get all Envoys with their paths
 for path, envoy in model.named_modules():
-    print(path)  # e.g., "model.transformer.h.0.attn"
+    parameter = next(envoy._module.parameters(), None)
+    if parameter is not None:
+        print(path, parameter.device)
 
-# Filter modules
-attention_envoys = model.modules(
-    include_fn=lambda e: "attn" in e.path
+mlp = model.get("transformer.h.0.mlp")
+```
+
+If a submodule's name shadows an `Envoy` attribute (BERT names a submodule
+`output`, for instance), the submodule keeps the name and nnsight's attribute moves
+to `nns_<name>`, with a warning.
+
+### 5.10 Custom envoy classes (envoys=)
+
+By default every node in the tree — root and all children — is the base `Envoy`.
+Sometimes you want a *particular* module to be a richer envoy: an attention module
+that exposes a per-head `.heads` view via its own [eproperty](#52-eproperties-how-values-are-hooked),
+say. The `envoys=` constructor argument maps a **module type** (matched against the
+module's MRO) or a **dotted path suffix** (`"attn"`, `"transformer.h"`) to a custom
+`Envoy` subclass. When a child's module or path matches, it is wrapped with that
+subclass instead of the base `Envoy`; non-matching modules stay base `Envoy`. The map
+is inherited all the way down the tree, so it applies wherever the match occurs.
+
+```python
+from nnsight.intervention.eproperty import eproperty
+
+class AttnEnvoy(Envoy):
+    @eproperty(key="output")
+    def attention_output(self, value):
+        return value[0]  # GPT-2 attention returns (output, weights)
+
+model = TransformersModel(
+    "openai-community/gpt2", task="text-generation", dispatch=True, attn_implementation="eager",
+    envoys={"attn": AttnEnvoy},
 )
+with model.trace("Hello world"):
+    attention_output = model.transformer.h[0].attn.attention_output.save()
 ```
 
-#### Path-Based Access
-
-Use `.get(path)` to fetch an Envoy by its path string:
-
-```python
-# These are equivalent:
-mlp = model.transformer.h[0].mlp
-mlp = model.get('transformer.h.0.mlp')
-
-# Useful for dynamic access
-layer_idx = 5
-layer = model.get(f'transformer.h.{layer_idx}')
-```
+This is the wiring that lets a custom eproperty live on the *right* module rather
+than on the model class. The full treatment — defining the eproperty, its
+`.transform` for a reshaping view, and the alternatives (a subclass of the model,
+`tracer.result`, a runtime's `.logits`) — is in
+[Extending nnsight](#10-extending-nnsight) and
+[docs/developing/extending-envoy.md](https://github.com/ndif-team/nnsight/blob/main/docs/developing/extending-envoy.md).
 
 ---
 
-### 4.11 Accessing the Underlying Module
+## 6. Features
 
-If you need access to the real PyTorch module, use `._module`:
+Everything up to here has been about the shape of a trace: you open a `with` block, the model runs, and [interleaving](#4-interleaving) pauses the model wherever your code asks for a value. This section is the working vocabulary that lives inside that block — the verbs and nouns you reach for once the basic idea is in hand. Each subsection stands on its own; read the one that matches your task.
 
-```python
-# Get the actual torch.nn.Module
-real_module = model.transformer.h[0]._module
-```
+A few of these are so fundamental that the rest assume them. Saving (§6.1) is how any value survives the block at all. Generation (§6.2) and iteration (§6.3) are inseparable — a generation loop is the whole reason a location can be reached more than once, and iteration is how you target which reach. The others — editing, skipping, gradients, barriers, scanning, caching — are each a single idea layered onto the trace you already understand.
 
-Note that for most attributes, you don't need this - `envoy.weight` works because Envoy's `__getattr__` delegates to the underlying module:
+### 6.1 Saving values
 
-```python
-# These are equivalent:
-weights = model.lm_head.weight
-weights = model.lm_head._module.weight
-```
-
----
-
-## 5. Features
-
-This section covers the key features that make NNsight powerful for interpretability research.
-
----
-
-### 5.1 Saving Values
-
-Values accessed inside a trace only exist during the trace. To persist them after the context exits, you must **save** them.
-
-#### The Problem
-
-```python
-with model.trace("Hello"):
-    hidden = model.transformer.h[0].output[0]  # This is a real tensor
-
-print(hidden)  # Error! hidden is no longer valid
-```
-
-#### The Solution: `.save()`
-
-```python
-with model.trace("Hello"):
-    hidden = model.transformer.h[0].output[0].save()  # Mark for persistence
-
-print(hidden)  # Works! hidden contains the saved tensor
-```
-
-#### Implementation: Pymounting
-
-NNsight uses a C extension (`py_mount.c`) to add `.save()` to Python's base `object` class. This allows calling `.save()` on any value:
-
-```c
-// From py_mount.c
-static PyObject* mount_function(PyObject* self, PyObject* args) {
-    // ...
-    PyObject *dict = get_dict(&PyBaseObject_Type);
-    PyDict_SetItemString(dict, mount_point, method);
-    PyType_Modified(&PyBaseObject_Type);
-    // ...
-}
-```
-
-This mounts the `save` function directly onto `PyBaseObject_Type`, making it available on all Python objects.
-
-**Limitation:** Objects that already define `.save()` (like some PyTorch classes) won't use NNsight's version.
-
-#### The Preferred Alternative: `nnsight.save()`
-
-For objects that already have `.save()`, or when pymounting is disabled:
+The trace body does not run in your frame. It is captured, compiled, and executed against a *copy* of your locals (see [Interleaving](#4-interleaving) and `src/nnsight/tracing/tracer.py`), so by default nothing it computes flows back to you. A variable you bind inside the block simply vanishes when the block exits — read it afterward and you get `UnboundLocalError`. **Saving is how you name the exceptions.** `nnsight.save(x)` (or, equivalently, `x.save()`) marks a value to survive past the trace; on exit, `push_result` writes back only the marked values that are also bound to a name.
 
 ```python
 import nnsight
+from nnsight.modeling.transformers import TransformersModel
 
-with model.trace("Hello"):
-    hidden = nnsight.save(model.transformer.h[0].output[0])
+model = TransformersModel("openai-community/gpt2", task="text-generation", dispatch=True, attn_implementation="eager")
 
-print(hidden)  # Works
+with model.trace("The Eiffel Tower is in the city of"):
+    hidden = model.transformer.h[-1].output.save()
+    logits = nnsight.save(model.output.logits)
+
+print(hidden.shape, logits.shape)   # readable after the block
 ```
 
-#### Configuration
+Two properties of `save` explain everything that can go wrong with it. First, **it marks the concrete object by identity and returns it unchanged**, so you save the value you bind — `h = x.save()`, never `(x.save() * 2)`, which marks `x` and returns the (unsaved) product. Write `(x * 2).save()` instead. Second, **a marked value only comes back if it is bound to a name** the body can push back: a bare `model.output.logits.save()` on its own line marks the tensor but leaves no local to return it under, so it silently never appears. This is invisible locally but bites hard on vLLM and [remote execution](#9-remote-execution), where results are read back by name.
 
-Pymounting has some performance cost and can be disabled:
+**`save` raises outside a trace.** With no trace running there is nowhere to hand the value back *from*, and its mark would be cleared before anything could read it — so calling it with no trace active is a `ValueError`, not a silent no-op:
 
 ```python
-from nnsight import CONFIG
-CONFIG.APP.PYMOUNT = False  # Disable obj.save(), use nnsight.save() instead
+try:
+    xs = nnsight.save([])  # Expected failure: called outside a trace
+except ValueError:
+    print("Save inside the trace")
 ```
 
-The `.save()` method was added primarily for backwards compatibility with NNsight 0.4. New code can use either approach.
+This is the single most common structural mistake, because it collides with the idiom for gathering values. **The rule for collections is: save the container, store raw values in it.** Create the list (or dict) *inside* the trace, save the container itself, and append unmarked values:
+
+```python
+with model.generate("The Eiffel Tower is in", max_new_tokens=3, min_new_tokens=3) as tracer:
+    xs = nnsight.save([])                                  # save the container
+    for step in tracer.iter[:3]:
+        xs.append(model.transformer.h[-1].output[:, -1, :])   # append raw values
+    final = tracer.result.save()
+# xs holds the 3 collected values; final is the generated ids
+```
+
+Two ways this goes wrong, both worth internalizing:
+
+- **Saving the elements** — `xs.append(x.save())`, or a `[b.output.save() for b in ...]` comprehension — marks values with no name to return them under. It happens to work locally, because the appends mutate a list in a frame you still hold, but on a remote trace the appends happen server-side and *nothing comes back*.
+- **Leaving the container unsaved** — `xs = []` inside the trace with no `save`, or a comprehension bound to an unsaved name — never pushes the container back, so it is `UnboundLocalError` after the block.
+
+A comprehension follows the same one rule: `hiddens = nnsight.save([b.output for b in model.transformer.h])` — save the whole list, keep the elements raw.
+
+**Two forms, and when to prefer each.** `x.save()` is mounted on *every* Python object by an optional C extension gated by `CONFIG.APP.PYMOUNT` (default on). Tensors read from `.output`/`.input` always carry `.save()`; but for plain Python values (ints, lists, `torch.Size`) the method exists only if the extension built, so `nnsight.save(x)` — a plain function with no mount dependency — is the safe choice there. When in doubt, use `nnsight.save(x)`. (`docs/usage/save.md`, `docs/gotchas/save.md`.)
+
+Saving nests cleanly. Only the *outermost* trace filters to saved values; an inner trace pushes all its locals up to the enclosing block. This is what makes [sessions](#611-sessions) and [gradient blocks](#66-gradients) let values flow without a `save` at every boundary.
+
+### 6.2 Generate vs pipe
+
+A single [trace](#4-interleaving) runs one forward pass. Real language work needs more than one: autoregressive decoding runs the model once per generated token. nnsight gives you two doors into that, and they return fundamentally different things because they run different code.
+
+**`model.generate(input, max_new_tokens=N, ...)` runs the model's own `generate`** and returns the **token ids** on `tracer.result` — a `[batch, seq]` tensor of the prompt plus completion. It uses the checkpoint's own generation settings, so it is **greedy by default** (it does not apply the sampling a task pipeline would); ask for sampling explicitly with `do_sample=True`. Every kwarg (`generation_config=`, `num_return_sequences=`, ...) is forwarded to the model's `generate`.
+
+```python
+with model.generate("The Eiffel Tower is in the city of", max_new_tokens=3, min_new_tokens=3) as tracer:
+    ids = tracer.result.save()
+print(model.tokenizer.decode(ids[0]))     # ...the city of Paris, and
+```
+
+The finished ids also pass through a `Generator` module, so per-step token access is available at `model.generator.streamer.output` — the prompt arrives as one block, then one new token per step. (Reading the *finished* ids at `model.generator.output` still works but is deprecated; use `tracer.result`.)
+
+**`model.pipe(input, ...)` runs the whole `transformers.pipeline`** end to end and returns what it **postprocesses to** — decoded-text records for text-generation (`[{"generated_text": ...}]`), label/score dicts for a classifier, and so on. Because the pipeline applies the checkpoint's `task_specific_params`, pipe output is **sampled by default** for gpt2; pass `do_sample=False` for reproducible output.
+
+```python
+with model.pipe("The Eiffel Tower is in the city of", max_new_tokens=5, min_new_tokens=5, do_sample=False) as tracer:
+    records = tracer.result.save()
+print(records[0]["generated_text"])
+```
+
+Both are ordinary tracing contexts — your interventions fire on every forward the decode loop makes. The choice is about the return value and the defaults: reach for `generate` when you want token ids and per-step interventions on the model's own settings; reach for `pipe` when you want the pipeline's decoded records and its preprocessing. (`docs/usage/generate.md`, `docs/usage/pipe.md`.)
+
+### 6.3 Iteration
+
+In a single forward pass a module is reached exactly once. In a generation loop it is reached once per decoded step, so `model.transformer.h[0].output` names a *different occurrence* each step. Iteration is how you say which occurrences a stretch of trace body targets.
+
+```python
+with model.generate("Hello", max_new_tokens=3, min_new_tokens=3, do_sample=False) as tracer:
+    toks = nnsight.save([])
+    for step in tracer.iter[:3]:
+        toks.append(model.lm_head.output[0, -1].argmax(-1))
+```
+
+`tracer.iter` accepts a slice, an int, or a list: `tracer.iter[:3]` is steps 0–2, `tracer.iter[2]` is just step 2, `tracer.iter[[0, 2, 4]]` is those steps only. `tracer.all()` is exactly `tracer.iter[:]`. `step` is the real integer index, so a plain Python `if step == 2:` works inside the loop. Under the hood, looping over `tracer.iter` walks the running mediator's `iteration` pointer across the selected occurrences (`src/nnsight/intervention/iterator.py`), and restores it on exit, so loops nest.
+
+**The gotcha that defines correct usage: a loop that outruns the run drops every line after the loop.** An open-ended selection keeps handing out step indices until the model stops generating, and a bounded one that asks past the run's end reaches the same point; the final over-run request — for a step the model never runs — is left parked, and the interleaver throws `OutOfOrderError` into that worker, which is caught and *warned*, not raised. But that unwinding tears down the loop **and every statement after it in the same block**. So a `tracer.result.save()` placed after an over-running loop never runs, and what the loop saved looks complete while being short.
+
+The fix is to use a **bounded** `iter[:N]` matching `max_new_tokens` — then the loop ends normally and trailing code executes:
+
+```python
+with model.generate("Hello", max_new_tokens=3, min_new_tokens=3, do_sample=False) as tracer:
+    xs = nnsight.save([])
+    for step in tracer.iter[:3]:
+        xs.append(model.lm_head.output[0, -1].argmax(dim=-1))
+    ids = tracer.result.save()                       # runs, because the loop was bounded
+```
+
+`max_new_tokens` is a cap, not a guarantee — if the model stops early (EOS), the steps that didn't happen warn but the reached steps' saved values are kept. Negative indices raise `ValueError` (there is no "last step" shorthand), and there is **no `tracer.next()`** — the old manual-stepping API is gone. The `with tracer.iter[...]:` block form still works but is deprecated in favor of the `for` loop. (`docs/usage/iter-all-next.md`.)
+
+### 6.4 Editing a model
+
+An intervention written inside a trace applies once, to that trace. An *edit* makes it permanent: `model.edit(...)` captures the same intervention DSL but, instead of running it against a live forward, **stores it on the envoy** to be replayed on every later trace. This is how you install always-on transforms — zero a head, add a steering vector, swap in an SAE — without rewriting each trace.
+
+```python
+with model.edit() as (tracer, edited):
+    edited.transformer.h[0].output[:] = 0
+
+with edited.trace("Hello world"):
+    out = edited.transformer.h[0].output.save()   # zeros — edit applied
+with model.trace("Hello world"):
+    orig = model.output.save()                        # original model, untouched
+```
+
+The default `model.edit()` stores the edit on a **shallow copy** of the envoy (its module, interleaver, and children are shared — no weights are duplicated; only the `_edits` list is independent), leaving the original clean, and binds `(tracer, edited)`. `model.edit(inplace=True)` stores it on the envoy itself and binds only `tracer`. Clear stored edits with `model.clear_edits()`.
+
+Stored edits live in `envoy._edits` and run **first** on every later trace — `Envoy.interleave` prepends them to the run's mediators (`src/nnsight/intervention/envoy.py`), so an edit's swap lands before a same-trace intervention reads that location, and their effects are visible to your code. Multiple edits stack in registration order. A plain edit applies at the *first* occurrence of a location; to re-apply it every step of a generation loop, put the passthrough under the edit tracer's `iter` (see [Iteration](#63-iteration)). Because `_edits` serializes by value, edits ride with the model to a [remote server](#9-remote-execution). (`docs/usage/edit.md`.)
+
+### 6.5 Skipping and early stopping
+
+Two ways to *not run* part of the model, at two different scales.
+
+**`module.skip(replacement)` bypasses one module.** When the model is about to run that module, its forward is not executed — `replacement` is used as its output instead. A skip gate is installed on every module up front (via the source/skip controller), so it works even when the replacement is read from the module's own `.input` — turning the module into a pass-through:
+
+```python
+with model.trace("Hello world"):
+    model.transformer.h[1].skip(model.transformer.h[1].input)
+    out = model.output.save()
+```
+
+The replacement must match the shape and type the module would normally return — for a GPT-2 block that is a plain tensor, for some attention submodules a tuple. In a batched trace a `.skip()` must cover **every** row: skip the module in every invoke or none, because a shared forward can't run for only the unskipped rows (otherwise `ValueError: A batched .skip() has to cover every row`). A skip is one-shot per module call; across generation steps each step needs its own, via `tracer.iter[...]` or a persistent [edit](#64-editing-a-model).
+
+**`tracer.stop()` aborts the whole run** at the point the worker is parked — everything captured before it is kept, nothing after it in the model runs. Save what you need *before* stopping, because code after `tracer.stop()` in the same block never executes (Python raises `EarlyStopException` at the call, which the interleaver treats as a clean early exit and swallows):
+
+```python
+with model.trace("Hello world") as tracer:
+    h0 = model.transformer.h[0].output.save()   # save first
+    tracer.stop()                                # layers 1..N never run
+```
+
+Requesting a location the run never reached — a module after the stop, or the inner submodules of a skipped module — raises `OutOfOrderError`. (`docs/usage/skip.md`, `docs/usage/stop-and-early-exit.md`.)
+
+### 6.6 Gradients
+
+Reading activations is the forward story; `with tensor.backward():` is the backward one. It runs the real backward pass **interleaved** with the body of its block — a nested interleaving session in its own right — so the block can read and replace the `.grad` of any tensor as the gradient reaches it. nnsight patches `torch.Tensor.backward` at import; a bare `tensor.backward()` with no `with` falls through to vanilla PyTorch.
+
+A backward block is almost always nested inside a forward trace, so the tensors whose gradients you want are the real ones the run produced. **Capture those forward tensors before the backward block** — the forward pass is over by the time autograd runs, so `.output`/`.input` are unreachable inside it; only `.grad` is meaningful there.
+
+```python
+with model.trace("Hello world"):
+    hs   = model.transformer.h[-1].output      # capture the forward tensor first
+    loss = model.output.logits.sum()
+    with loss.backward():                       # real backward, interleaved
+        g = hs.grad.clone().save()              # gradient flowing into hs
+        hs.grad = hs.grad * 2                   # ...and replace it downstream
+```
+
+Reading `t.grad` parks the block until autograd produces that gradient (a self-removing hook is registered on `t`); assigning `t.grad = v` swaps a replacement into the same channel. Because gradients flow backward, **request `.grad` in reverse-forward order** — later layers first — or hit `OutOfOrderError`. Request it on the tensor you captured directly, not on a slice or index of it (an indexing view is a new tensor whose gradient isn't the one autograd delivers). `retain_graph=True` supports multiple backward passes over one graph. As a nested trace, a backward block pushes its locals up, so a value saved inside reaches you through the outer trace's boundary. (`docs/usage/backward-and-grad.md`.)
+
+### 6.7 Barriers
+
+Inside a single trace with several `with tracer.invoke(x):` blocks (see [Batching](#72-batching)), each block runs as its own worker, and workers resume **in the order the model reaches what each asked for**, not the order they were written. That is exactly what makes them a batch rather than a sequence — but it means a value one invoke reads and another writes has no guaranteed ordering, and neither worker can see the other's progress. A value produced in one invoke is not visible in another until the ordering is pinned.
+
+`tracer.barrier(n)` is that meeting point. Every block that participates calls the returned barrier; each waits, and the last of the `n` to arrive releases them all — so everything written *above* a barrier has happened before anything written *below* one.
+
+```python
+with model.pipe(max_new_tokens=3, min_new_tokens=3, do_sample=False) as tracer:
+    barrier = tracer.barrier(2)
+    with tracer.invoke("Madison Square Garden is in the city of"):
+        embeddings = model.transformer.wte.output
+        barrier()                                    # signal: embeddings read
+        result = tracer.result.save()
+    with tracer.invoke("_ _ _ _ _ _ _ _ _"):
+        barrier()                                    # wait for the read
+        model.transformer.wte.output = embeddings    # then hand it across
+```
+
+Both invokes touch `wte.output`; without the barrier the second worker would try to swap in `embeddings` before the first had bound the name — `NameError`. The barrier is called, not entered (it is not a context manager), works for any `n`, and is reusable (it empties its waiting list on release). Reach for it whenever two or more invokes hand a value across the *same* module; when they touch different modules, shared invoke scope already handles it. If fewer than `n` blocks call it, it never releases and the run ends reporting the unmet count. (`docs/usage/barrier.md`.)
+
+### 6.8 Scanning
+
+`model.scan(input)` runs the forward under PyTorch's `FakeTensorMode`: tensors carry shape, dtype, and device but no real data, no kernels run, and — crucially — **the model is not dispatched**. It is a full tracing context (a `ScanningTracer`, subclass of the interleaving tracer), so every primitive works — `.output`, `.input`, `.save()`, `tracer.invoke`, `tracer.cache` — but nothing computes. Use it to inspect activation shapes or validate shape-dependent code (slicing, reshapes, intervention indexing) without paying to load weights or run the model.
+
+```python
+model = TransformersModel("openai-community/gpt2", task="text-generation")
+print(model.dispatched)   # False — architecture on meta, no real weights
+
+with model.scan("The Eiffel Tower is in"):
+    dim = nnsight.save(model.transformer.h[0].output.shape[-1])   # int
+    hs  = model.transformer.h[-1].output.save()                   # a FakeTensor
+print(dim, tuple(hs.shape))   # 768 (1, 7, 768)
+print(model.dispatched)       # still False
+```
+
+Because scan is a tracing context, **`save` is still required** — the same exit filter applies. The values it hands back are fake tensors: read their `.shape`/`.dtype`/`.device` inside the block, but a fake tensor is valid only within the scan (it cannot be used once the fake mode exits), and shapes come back as `torch.Size`/`int`, so prefer `nnsight.save(...)` for those. Shapes seen in a scan match a real forward. Some ops lack a fake/meta kernel and will raise inside scan even when they run for real. (`docs/usage/scan.md`.)
+
+### 6.9 Caching
+
+Reading one location with `.output` is the retail path; `tracer.cache(...)` is the wholesale one. It records the activations of *many* modules at once across the whole run — every selected layer, and in a generation loop every step. Because the interleaver already funnels every module input/output through `handle` (applying interventions first), the cache is just a **post-intervention observer** — it needs no per-module hooks (`src/nnsight/intervention/cache.py`).
+
+```python
+with model.trace("The Eiffel Tower is in") as tracer:
+    cache = tracer.cache()                          # every module's output
+cache["model.transformer.h.0"].output               # by path
+cache.transformer.h[0].output                       # or by tree navigation
+```
+
+The returned `CacheView` fills in as the run proceeds and is already saved, so it survives the trace. Read a module's captured value with `.output`, `.inputs`, or `.input` after selecting it — by absolute path (`cache["model.transformer.h.0"]`) or by navigating the envoy tree (`cache.transformer.h[0]`), which resolves renames and `ModuleList` indices the same way the model does. Select a subset with `modules=[...]` (envoys or path strings), capture inputs with `include_inputs=True`, and control storage with `device` (default CPU), `dtype`, and `detach`.
+
+Two things shape correct use. **Only modules reached *after* the `tracer.cache(...)` call are captured**, so call it early. And **a module visited more than once accumulates one entry per visit**: `cache[path].output` unwraps a single visit to the value directly but returns a *list* for multiple visits (a generation loop), with `len(cache[path])` the visit count. A cache opened inside an invoke records that invoke's rows only. (`docs/usage/cache.md`.)
+
+### 6.10 The trace result
+
+`tracer.result` is the value the traced call returned — the model's output for `trace`, the token ids for `generate`, the pipeline's records for `pipe`. It is an `eproperty` (`src/nnsight/intervention/tracer.py`): reading it parks the intervention worker until the traced call produces and serves its return value. Like any traced value it must be saved to survive the block:
+
+```python
+with model.generate("Madison Square Garden is in", max_new_tokens=3, min_new_tokens=3) as tracer:
+    ids = tracer.result.save()
+```
+
+The subtlety is [batching](#72-batching): served through the interleaver's `handle`, `tracer.result` read *inside* an invoke is narrowed to that invoke's rows, so each invoke sees its own slice of the combined output. Read at the trace level it is the whole result. This is why in the [barrier](#67-barriers) example each invoke can save its own `tracer.result` and get back only its prompt's continuation.
+
+### 6.11 Sessions
+
+Each `with model.trace(...)` is its own boundary: trace-local bindings cross to your calling code only when saved, and those saved values can be reused in another trace. A **session** removes that per-trace boundary. `with model.session():` encloses several traces so a value read in one is available in a later one **without** a `save`, because the *session* — not each trace — is the boundary back to your code.
+
+```python
+with model.session():
+    with model.trace("Madison Square Garden is in the city of"):
+        hs = model.transformer.h[5].output[:, -1, :]     # no .save() needed
+    with model.trace("_ _ _ _ _ _ _"):
+        model.transformer.h[5].output[:, -1, :] = hs     # flows in
+        patched = model.output.logits.argmax(dim=-1).save()   # SAVE — leaves the session
+print(patched)
+```
+
+This is a direct consequence of the save-nesting rule from §6.1: the save filter runs only at the *outermost* boundary, and a session is that boundary — each inner trace pushes all its locals up. So `hs` needs no save (it stays inside the session), but `patched` does (it crosses back to plain Python). The session body is real Python: loops, conditionals, and building lists all run natively around the nested traces, which execute as they are reached.
+
+A session is also how **multiple traces batch into a single [remote](#9-remote-execution) job** — `remote=True` on the *session* (not the inner traces) ships the whole block as one job, and the inner traces run against the server's model when it executes the body. Mechanically there is no separate session state: `model.session()` returns a plain `Tracer` that captures the block, execs it as real Python, and gates saves at its own outermost boundary (`src/nnsight/intervention/envoy.py`). (`docs/usage/session.md`.)
 
 ---
 
-### 5.2 Ad-hoc Module Calls
+## 7. Modeling
 
-Inside a trace, you can call modules directly on intermediate values. This is essential for techniques like **logit lens**.
+Everything so far — the trace, [interleaving](#4-interleaving), [the envoy tree](#5-the-envoy) — works on any `torch.nn.Module`. What the *modeling* layer adds is everything that surrounds a real model: building it from a repo id, deferring its weights until you actually run, tokenizing a prompt, batching several prompts into one forward, and carrying an identity a remote server can reconstruct. None of that is intervention machinery; it is the plumbing that lets you write `TransformersModel("openai-community/gpt2", task="text-generation")` instead of hand-assembling a pipeline and feeding it tensors.
 
-#### The Pattern
+The design keeps that plumbing out of the intervention core. `NNsight(module)` is the whole contract the rest of nnsight depends on — a root [Envoy](#5-the-envoy) over a module tree. The model wrappers are Envoy *subclasses* that layer loading, tokenization, and remote identity on top, each concern a separate mixin so a wrapper takes only the ones it needs. Model classes are exposed lazily from the root package (a module-level `__getattr__`), so `import nnsight` never drags in `transformers`, `diffusers`, or `vllm` — an optional dependency errors only when its model is actually used.
 
-```python
-with model.trace(prompt) as tracer:
-    # Get intermediate hidden states
-    hidden_states = model.transformer.h[-1].output[0]
-    
-    # Apply ln_f and lm_head to decode hidden states
-    logits = model.lm_head(model.transformer.ln_f(hidden_states)).save()
-    
-    # Get predicted tokens
-    tokens = logits.argmax(dim=-1).save()
+Source lives under `src/nnsight/modeling/`. The routing doc is [docs/models/index.md](https://github.com/ndif-team/nnsight/blob/main/docs/models/index.md), with a page per class.
 
-print(model.tokenizer.decode(tokens[0]))
-```
+### 7.1 The mixin architecture
 
-#### How It Works
+The base of every model is `NNsight(torch.nn.Module)` — which is to say, `NNsight` *is* an `Envoy` (`modeling/base.py`). Wrap any module and you get the envoy tree plus `.trace()`, `.scan()`, `.edit()`, `.session()`, `.cache()` for free. `NNsight` adds nothing but a conventional name for "wrap a whole model"; it is a thin named `Envoy`. Use it directly for a custom net or any non-HuggingFace module.
 
-When you call `model.lm_head(hidden_states)` inside a trace:
+On top of that base sits a short chain of mixins, each earning its place by adding one behavior. Reading up from `Envoy`:
 
-1. The Envoy's `__call__` method is invoked
-2. It checks if currently interleaving
-3. If yes, it calls `self._module.forward(*args)` directly (bypassing hooks)
-4. The result is a real tensor that can be further processed
+- **`Loadable`** (`mixins/loadable.py`) — an Envoy that loads its *own* module. Every construction routes through `_load`, which returns the module to wrap. The base `_load` returns a ready `torch.nn.Module` as-is, so `Loadable(mod)` wraps it directly; anything else is `NotImplementedError` until a subclass overrides it. This is the single decision point where a subclass decides *what a pre-loaded module means* — `TransformersModel` wraps it in a pipeline, `DiffusionModel` treats it as a component. The `rename`/`envoys` arguments are Envoy concerns, so they are threaded to `Envoy.__init__` and kept out of `_load`.
+
+- **`Meta`** (`mixins/meta.py`) — the lazy build. Loading a large model's weights is slow and memory-hungry, but planning a trace only needs the model's *structure* — the module tree and the shapes flowing through it — which is fixed by config, not weights. So `Meta` does a two-phase build: `_load_meta` constructs a weightless skeleton on the *meta* device up front (a `MetaDevice` torch-function mode forces every tensor onto meta however it is created), and `dispatch()` loads real weights via `_load` and swaps them into the existing envoy tree the first time the model actually runs. `scan()` runs the forward under fake tensors and never dispatches; only a real `interleave()` triggers `dispatch()`. Passing a ready module, or `dispatch=True`, skips the meta phase and loads eagerly.
+
+- **`Remotable`** (`mixins/remotable.py`) — remote identity. A remote run does not ship the model; the server already has it loaded. What travels is a **model key** of the form `"import.path.ClassName:model_key"`: the import path names the wrapper class to reconstruct, the suffix names the checkpoint. `Remotable` adds `to_model_key()`/`from_model_key()`, routes `remote=` on `.trace()`/`.session()` through the remote (or local-simulation) backend, and gives subclasses per-request environment hooks (`_remoteable_get_env`/`_remoteable_set_env`) and a persistent-object map so tokenizers and modules resolve to the server's live objects rather than being serialized. See [Remote execution](#9-remote-execution) for the full flow.
+
+From `Remotable` the tree forks. `HuggingFaceModel(Remotable)` (`modeling/huggingface.py`) is the shared HuggingFace base — it builds the architecture on meta from the repo's config (`AutoConfig` + `from_config`) and loads real weights on dispatch (`from_pretrained`), with the auto class configurable through `AUTO_CLASS`. Its `_remoteable_model_key` canonicalizes the repo id via the Hub so different spellings of the same model produce the same key. `TransformersModel` and `DiffusionModel` extend it. `VLLM(Remotable)` branches off directly, since a vLLM engine loads and runs nothing like a HuggingFace module.
+
+**The load flow, end to end.** You construct a wrapper; unless you passed a ready module or `dispatch=True`, `Meta.__init__` opens a `MetaDevice` context and calls `_load_meta` to build the weightless skeleton, then `Envoy.__init__` mirrors it as the envoy tree. You can `scan()` for shapes at this point with no weights in memory. The first real `.trace()`/`.generate()` calls `interleave`, which sees the model is undispatched and calls `dispatch()` → `_load` → `_update` (real weights swapped into the same envoy objects, so any aliases you hold stay valid). From then on the model is loaded.
 
 ```python
-def __call__(self, *args, hook: bool = False, **kwargs):
-    return (
-        self._module.forward(*args, **kwargs)
-        if self.interleaving and not hook
-        else self._module(*args, **kwargs)
-    )
-```
-
-The `hook=False` default means ad-hoc calls **don't** trigger the normal input/output hooks. This is intentional—you're applying the module outside its normal position in the forward pass.
-
-#### Use Cases
-
-| Technique | Description |
-|-----------|-------------|
-| Logit Lens | Decode hidden states from any layer |
-| Probing | Apply a probe/classifier to intermediate representations |
-| Custom Decoding | Apply specific heads or projections |
-
----
-
-### 5.3 Multi-Token Generation
-
-For autoregressive language models, the same modules are called multiple times—once per token. NNsight provides iteration controls to intervene on specific generation steps.
-
-#### The Iteration Cursor
-
-Each Mediator tracks which iteration it's requesting via `mediator.iteration`. The Interleaver appends this to provider strings (`.i0`, `.i1`, etc.).
-
-By default, `iteration = 0`, meaning the Mediator requests the first call to each module. To request later iterations, you move the cursor.
-
-#### `tracer.iter` - Iteration Slicing
-
-```python
-with model.generate("Hello", max_new_tokens=5) as tracer:
-    logits = list().save()
-    
-    # Iterate over ALL generation steps
-    with tracer.iter[:]:
-        logits.append(model.lm_head.output.save())
-```
-
-`tracer.iter` accepts:
-
-| Syntax | Meaning |
-|--------|---------|
-| `tracer.iter[2]` | Single iteration (step 2) |
-| `tracer.iter[:]` | All iterations |
-| `tracer.iter[1:4]` | Steps 1, 2, 3 |
-| `tracer.iter[::2]` | Every other step |
-
-When you enter a `with tracer.iter[...]` block, it:
-
-1. Sets the Mediator's iteration to `None` (unbounded) or specific values
-2. Loops, advancing the iteration cursor each time
-3. Stops when no more iterations are available
-
-#### `tracer.all()` - Shorthand for All Iterations
-
-```python
-with model.generate("Hello", max_new_tokens=5) as tracer:
-    with tracer.all():
-        # Runs for every generation step
-        model.transformer.h[0].output[0][:] = 0
-```
-
-Equivalent to `tracer.iter[:]`.
-
-#### `tracer.next()` - Manual Cursor Advancement
-
-```python
-with model.generate("Hello", max_new_tokens=3) as tracer:
-    # Step 0
-    out0 = model.lm_head.output.save()
-    
-    tracer.next()  # Move cursor to step 1
-    
-    # Step 1
-    out1 = model.lm_head.output.save()
-    
-    tracer.next(2)  # Skip ahead by 2
-    
-    # Step 3
-    out3 = model.lm_head.output.save()
-```
-
-#### Step Index in Iteration
-
-The `with tracer.iter[:] as step_idx` pattern provides the current step:
-
-```python
-with model.generate("Hello", max_new_tokens=5) as tracer:
-    with tracer.iter[:] as step_idx:
-        if step_idx == 2:
-            # Only intervene on step 2
-            model.transformer.h[0].output[0][:] = 0
-```
-
-#### ⚠️ Warning: Unbounded Iteration Footgun
-
-**Critical footgun with `tracer.iter[:]` and `tracer.all()`:**
-
-When you use an unbounded iterator (`iter[:]`, `iter[start:]`, or `all()`), the iterator doesn't know when to stop. It waits forever for the "next" iteration that never comes. When the model's forward pass completes:
-
-1. The iterator is still waiting for the next iteration
-2. `check_dangling_mediators()` detects this and issues a **warning** (not an error)
-3. **All code AFTER the iter block never executes**
-
-```python
-# FOOTGUN EXAMPLE:
-with model.generate("Hello", max_new_tokens=3) as tracer:
-    with tracer.iter[:]:
-        hidden = model.transformer.h[-1].output.save()
-    
-    # ⚠️ WARNING: This line NEVER executes!
-    final_logits = model.output.save()
-
-# After the trace:
-print(hidden)       # Works - defined inside iter
-print(final_logits) # NameError: 'final_logits' is not defined!
-```
-
-**Why this happens:** The unbounded iterator keeps waiting for iteration 4, 5, 6... but generation stopped after 3 tokens. The code after the `with tracer.iter[:]` block never runs.
-
-**Solutions:**
-
-1. **Use a separate empty invoker** (recommended):
-   ```python
-   with model.generate("Hello", max_new_tokens=3) as tracer:
-       with tracer.invoke():  # First invoker - handles iteration
-           with tracer.iter[:]:
-               hidden = model.transformer.h[-1].output.save()
-       
-       with tracer.invoke():  # Second invoker - runs after generation
-           final_logits = model.output.save()  # Now runs!
-   ```
-   The second invoker runs after the first completes, avoiding the unbounded wait.
-
-
-
-2. **Use bounded iteration** (if you know the count):
-   ```python
-   with tracer.iter[:3]:  # Explicitly stop after 3 iterations
-       hidden = model.transformer.h[-1].output.save()
-   
-   final_logits = model.output.save()  # Now runs!
-   ```
-
-3. **Use `tracer.next()` for explicit control:**
-   ```python
-   for i in range(3):
-       hidden = model.transformer.h[-1].output.save()
-       tracer.next()
-   
-   final_logits = model.output.save()  # Runs after loop
-   ```
-
----
-
-### 5.4 Model Editing
-
-Model editing creates **persistent interventions** that apply to all future traces.
-
-#### Basic Usage
-
-```python
-# Create an edited model (non-destructive)
-with model.edit() as model_edited:
-    model.transformer.h[0].output[0][:] = 0
-
-# Original model is unchanged
-with model.trace("Hello"):
-    out1 = model.transformer.h[0].output[0].save()  # Normal output
-
-# Edited model applies the intervention
-with model_edited.trace("Hello"):
-    out2 = model_edited.transformer.h[0].output[0].save()  # Zeroed output
-```
-
-#### Implementation
-
-When `model.edit()` is called:
-
-1. A **shallow copy** of the Envoy is created (`_shallow_copy()`)
-2. The intervention code is compiled into Mediators
-3. These Mediators are stored in `_default_mediators`
-4. Future traces automatically include these Mediators
-
-```python
-def edit(self, *, inplace: bool = False):
-    return EditingTracer(self.__call__, self, inplace=inplace)
-```
-
-The `EditingTracer` doesn't execute the model—it just captures the intervention and stores it.
-
-#### In-Place Editing
-
-```python
-with model.edit(inplace=True):
-    model.transformer.h[0].output[0][:] = 0
-
-# Now ALL traces on model include this intervention
-with model.trace("Hello"):
-    out = model.transformer.h[0].output[0].save()  # Always zeroed
-```
-
-#### Clearing Edits
-
-```python
-model.clear_edits()  # Remove all persistent interventions
-```
-
-This clears `_default_mediators`, returning the model to its original behavior.
-
----
-
-### 5.5 Module Skipping
-
-Skip a module's execution entirely, substituting a custom value.
-
-#### Usage
-
-```python
-with model.trace("Hello"):
-    # Get layer 0's output
-    layer0_out = model.transformer.h[0].output
-    
-    # Skip layer 1 entirely, use layer 0's output as layer 1's output
-    model.transformer.h[1].skip(layer0_out)
-    
-    result = model.output.save()
-```
-
-#### Implementation
-
-The Interleaver wraps each module's `forward` method with a skippable wrapper:
-
-```python
-@wraps(forward)
-def nnsight_forward(*args, **kwargs):
-    nonlocal skip
-    
-    if skip is None or not self.interleaving:
-        return forward(*args, **kwargs)
-    
-    return skip  # Return the skip value instead of executing
-```
-
-When `.skip(value)` is called:
-
-1. A `SKIP` event is sent to the Interleaver
-2. The input hook catches the `SkipException`
-3. The `skip` variable is set to the replacement value
-4. The wrapped forward returns the skip value without executing
-5. The output hook passes through the skip value
-
-#### Constraint
-
-If you have multiple invokes, you must skip the module in **all** of them:
-
-```python
-with model.trace() as tracer:
-    with tracer.invoke("Hello"):
-        model.transformer.h[1].skip(some_value)  # Must skip in all invokes
-    
-    with tracer.invoke("World"):
-        model.transformer.h[1].skip(other_value)  # Must also skip here
-```
-
----
-
-### 5.6 Gradients
-
-NNsight supports gradient access and modification through a separate backward tracing context.
-
-#### Basic Usage
-
-```python
-with model.trace("Hello"):
-    hs = model.transformer.h[-1].output[0]
-    hs.requires_grad_(True)
-    
-    logits = model.lm_head.output
-    loss = logits.sum()
-    
-    # Backward is a separate trace!
-    with loss.backward():
-        grad = hs.grad.save()
-        
-        # Modify gradients
-        hs.grad[:] = 0
-
-print(grad.shape)
-```
-
-#### Implementation
-
-When you import NNsight, it monkey-patches `torch.Tensor.backward` to check if it's being used as a tracing context.
-
-The `BackwardsTracer`:
-
-1. Creates a **separate Interleaver** for the backward pass
-2. Uses tensor hooks (not module hooks) to intercept gradients
-3. Runs its own interleaving session during `backward()`
-4. Resumes the original interleaving session after
-
-```python
-# From backwards.py
-def wrap_grad(interleaver: Interleaver):
-    def getter(tensor: torch.Tensor):
-        wrap(tensor)
-        requester = id(tensor)
-        return interleaver.current.request(f"{requester}.grad")
-    
-    def setter(tensor: torch.Tensor, value: torch.Tensor):
-        wrap(tensor)
-        requester = id(tensor)
-        return interleaver.current.swap(f"{requester}.grad", value)
-    
-    return property(getter, setter)
-```
-
-The provider string uses the tensor's `id()` rather than a module path.
-
-#### Key Constraints
-
-1. **Cannot access `.output`/`.input` in backward context** — only `.grad`
-2. **Define tensors before the backward context** — access `.output` first, then `.grad` inside backward
-3. **Separate interleaving session** — the backward trace pauses the forward trace
-4. **Access gradients in reverse order** — gradients flow backwards, so access them in reverse order of the forward pass
-
-#### Gradient Access Order
-
-The backward pass follows the same interleaving principle as the forward pass, but in reverse:
-
-```
-Forward pass order:  layer0 → layer1 → ... → layer11 → lm_head → loss
-Backward pass order: loss → lm_head → layer11 → ... → layer1 → layer0
-```
-
-If you accessed `layer5.output` and `layer10.output` during the forward pass, you must access their gradients in reverse: `layer10.grad` first, then `layer5.grad`.
-
-#### Standalone Usage
-
-You can use backward tracing without a forward trace:
-
-```python
-# No forward trace needed
-with loss.backward():
-    grad = some_tensor.grad.save()
-```
-
----
-
-### 5.7 Early Stopping
-
-Stop model execution mid-forward when you only need early layers.
-
-#### Usage
-
-```python
-with model.trace("Hello") as tracer:
-    # Only need first 5 layers
-    for i in range(5):
-        out = model.transformer.h[i].output[0].save()
-    
-    tracer.stop()  # Don't execute remaining layers
-```
-
-#### Implementation
-
-`tracer.stop()` raises an `EarlyStopException`:
-
-```python
-def stop(self):
-    self.push()
-    raise EarlyStopException()
-```
-
-The Interleaver's `__exit__` catches this exception and suppresses it:
-
-```python
-def __exit__(self, exc_type, exc_val, exc_tb):
-    self._interleaving = False
-    
-    if exc_type is not None and issubclass(exc_type, EarlyStopException):
-        return True  # Suppress the exception
-```
-
-#### Use Cases
-
-- Performance optimization: skip unnecessary computation
-- Memory efficiency: don't compute layers you won't use
-- Layer-by-layer analysis: stop at specific depths
-
----
-
-### 5.8 Barriers
-
-Barriers synchronize execution across multiple invokes.
-
-#### The Problem
-
-With multiple invokes, each runs as a separate thread. Sometimes you need to:
-
-1. Wait for one invoke to complete something before another proceeds
-2. Share a value from invoke 1 to invoke 2 at a specific point
-
-While cross-invoker variable sharing (push/pull) handles simple cases, barriers provide explicit synchronization points.
-
-#### Usage
-
-Consider replacing layer 1's output in invoke 2 with invoke 1's value:
-
-```python
-with model.trace() as tracer:
-    with tracer.invoke("Hello"):
-        layer1_out = model.transformer.h[1].output[0]  # Invoke 1 gets value
-        # Barrier: wait here until invoke 2 is ready
-    
-    with tracer.invoke("World"):
-        # Invoke 2 needs layer1_out, but it's not available yet
-        model.transformer.h[1].output[0] = layer1_out
-```
-
-The problem: invoke 1's `layer1_out` isn't available until invoke 1 reaches layer 1. But invoke 2 might try to use it at layer 0.
-
-Barriers ensure the correct ordering by:
-
-1. Invoke 2 requests a barrier at a specific provider
-2. When that provider is reached, invoke 1 is resumed to provide the value
-3. Invoke 2 then continues with the value available
-
-#### Implementation
-
-The `BARRIER` event coordinates multiple mediators:
-
-```python
-def handle_barrier_event(self, provider, participants):
-    if participants is not None:
-        for mediator in self.interleaver.mediators:
-            if mediator.name in participants:
-                mediator.respond()
-                mediator.handle(provider)
-```
-
----
-
-### 5.9 Scanning
-
-Scanning runs the model with **fake tensors** to determine shapes and validate interventions without full execution.
-
-#### Usage
-
-```python
+model = TransformersModel("openai-community/gpt2", task="text-generation", attn_implementation="eager")
 with model.scan("Hello"):
-    # Access shapes without running real computation
-    dim = model.transformer.h[0].output[0].shape[-1]
-    
-    # Validate slicing
-    model.transformer.h[0].output[0][:, 10] = 0  # Will fail if seq_len < 11
-
-print(dim)  # 768
+    shape = nnsight.save(model.transformer.h[5].output.shape)
+assert not model.dispatched
+with model.trace("Hello"):
+    hidden = model.transformer.h[5].output.save()
 ```
 
-#### Implementation
+Because the chain has no ABCs, extension points are just underscore-prefixed methods with working defaults (`_load`, `_load_meta`, `_batch_size`, `_batch`). Subclassing is covered in [Extending nnsight](#10-extending-nnsight); the reference override to read is whichever of these methods your model needs to change.
 
-Scanning uses PyTorch's `FakeTensorMode` to create tensors that track shape and dtype without allocating memory:
+### 7.2 Batching
 
-1. Create fake input tensors
-2. Run the model with fake tensors
-3. Hooks capture fake outputs (which have correct shapes)
-4. Store fake values in `_fake_output` / `_fake_inputs`
+A single `with model.trace(input):` runs one forward over one input. But several `with tracer.invoke(x):` blocks inside one trace combine into a *single* batched forward, each block's interventions scoped to only its rows of every activation. Batching is what makes multi-prompt comparison a single efficient pass rather than a Python loop. The mechanism lives in `intervention/batching.py`; the user-facing side is [docs/concepts/batching-and-invokers.md](https://github.com/ndif-team/nnsight/blob/main/docs/concepts/batching-and-invokers.md), the internals in [docs/developing/batching-internals.md](https://github.com/ndif-team/nnsight/blob/main/docs/developing/batching-internals.md).
 
-After scanning, you can access shapes outside a trace:
+The split of responsibility is clean. The **model** knows how to turn inputs into a combined forward; the **Batcher** knows the row bookkeeping. Two model methods carry the model's half:
 
-```python
-# After scanning
-print(model.transformer.h[0]._fake_output[0].shape)  # [1, seq_len, hidden_dim]
-```
+- `_batch_size(*inputs, **kwargs)` — how many batch rows an invoke contributes (`0` means params-only, e.g. an invoke that just sets `max_new_tokens=` and expects the actual data in other invokes). The base default counts any input as one row; batching models report the true row count of a prompt / list / tensor / encoding.
+- `_batch(invokes, fn)` — assemble the collected invokes into the combined `(args, kwargs)` the run will use. This is where sequence lengths are equalized (padding), because the Batcher's row math is dim-0 only.
 
-#### Use Cases
+The `Batcher` (one per trace) does the rest. Each `add` records an invoke and assigns it a `batch_group` — a `[start, size]` row range in the combined batch. At run time `narrow` slices a full batched activation down to a block's rows when it reads, and `widen` splices an edit back into the full tensor. A tensor counts as batched only when its leading dim equals the combined `total`, so non-batched tensors pass through untouched. Crucially, narrowing only kicks in with two or more non-empty invokes — a lone invoke *is* the whole batch and sees every row untouched.
 
-- **Shape inference**: Determine dimensions before writing interventions
-- **Validation**: Check that slicing operations will work
-- **Quick iteration**: Test intervention logic without full computation
+A model picks its batcher through the `_batcher_class` class attribute (default `Batcher`). A model whose batch layout is not a plain dim-0 stack overrides `_narrow_tensor`/`_widen_tensor`. `DiffusionModel` does exactly this with `DiffusionBatcher`: a denoiser sees each prompt repeated `num_images_per_prompt` times and, under classifier-free guidance, the whole thing doubled (unconditional half then conditional half), so its batcher maps each invoke's plain `[start, size]` onto that expanded layout — reading and writing exactly the invoke's rows across both halves — by picking the case from the tensor's leading dim at run time.
 
-**Note:** Scanning is experimental. Some operations may not work correctly with fake tensors.
+`TransformersModel` supplies the most substantial batching (see 7.3): it batches text, token ids, and encodings, left-padding causal decoders and correcting `position_ids`, while refusing to batch inputs that cannot be padded together (a raw feature tensor, a multimodal encoding) rather than silently mangling them.
 
----
+Note that values produced inside one invoke are not visible in another; sharing across invokes needs `tracer.barrier(n)` (a Features concern, not a batching one).
 
-### 5.10 Caching
+### 7.3 TransformersModel
 
-Automatically cache module activations during a trace.
+`TransformersModel` (`modeling/transformers.py`) is **the** primary HuggingFace class — one wrapper for any task, not one class per modality. It is backed by a `transformers.pipeline` chosen by `task=` (inferred from the checkpoint when unset). The reason to lean on a pipeline rather than re-derive preprocessing: a `transformers.pipeline` already knows which preprocessors a task loads, how to turn its inputs into model inputs, and how to collate them — and all of that varies per task, per checkpoint, and per release of `transformers`. Reusing it is the "use the upstream primitive" principle in practice.
 
-#### Usage
+**Three ways to run it, and the difference matters:**
 
-```python
-with model.trace("Hello") as tracer:
-    cache = tracer.cache()
+- `trace` runs **one forward**. Its input is assembled here, so it accepts anything the model accepts — text, token ids, a tensor, or a pre-tokenized encoding.
+- `generate` generates **through the model** and returns token ids on `tracer.result`. It takes the same inputs a forward does and generates with the checkpoint's own settings (not the `task_specific_params` a pipeline would fold in).
+- `pipe` runs **the whole pipeline** — it tokenizes and collates its own input and returns what the pipeline postprocesses to (decoded text, labels, scores).
 
-# Access cached values after the trace
-layer0_out = cache['model.transformer.h.0'].output
-# or
-layer0_out = cache.model.transformer.h[0].output[0]
-```
+`generate` versus `pipe` is the distinction covered in [Generate vs pipe](#62-generate-vs-pipe): reach for `generate` when you want the ids (and per-step access), `pipe` when you want the pipeline's finished records.
 
-#### Implementation
+**Attributes.** The pipeline and its preprocessors are exposed directly: `pipeline`, `tokenizer`, `processor`, `image_processor`, `feature_extractor`. Which of them a task loads varies — a text task has a `tokenizer` and no `image_processor`, a multimodal one has a `processor` — so any of them may be `None`, and the one that will actually be used is `model.tokenizer`. Passing one in at construction adopts it instead of loading it. There is also `generator`, a standalone passthrough module that generation output flows through: reading the finished ids at `model.generator.output` is deprecated in favor of `tracer.result`, but `model.generator.streamer.output` gives per-step token access that `tracer.result` has no equivalent for. (This standalone child survives dispatch and PEFT rebinds, which only rebuild the tree from the HF module's own children.)
 
-Each invoke has its own cache. When `tracer.cache()` is called:
+It works across tasks — text-generation, fill-mask, text-classification, image-classification, image-text-to-text, feature-extraction, and more — and accepts either a repo id **or** a pre-loaded module. From a repo id, the pipeline loads the model and infers every preprocessor. From a pre-loaded module the factory can't infer, so the task is inferred from the architecture (`_infer_task`: a generative model is text-generation, otherwise the class-name suffix decides) or taken from `task=`, and preprocessors are sourced from what you passed or the model's `name_or_path`. Other construction options: `peft=<repo_id>` applies a LoRA adapter at load time (and can be swapped per request server-side via the remote env hooks); `rename=`, `envoys=`, and `dispatch=` are the standard Envoy/Meta arguments.
 
-1. A `Cache` object is created and registered with the current Mediator
-2. As the Mediator processes providers, the cache stores values
-3. After the trace, the cache contains all module outputs
+**Batching specifics.** `_batch_size`/`_num_rows` classify every input format — a string is one row, a list of strings one per prompt, a flat token-id list one row, a 2-D tensor or list-of-sequences one per leading entry, a chat conversation one row (not one per message). `_batch` dispatches on which run mode is active: `pipe` hands prompts to the pipeline with `batch_size`; `trace`/`generate` assemble model inputs here — each invoke's text goes through the task's own `preprocess`, and the per-invoke encodings are padded together by the pipeline's `pad_collate_fn`, while pre-tokenized ids and raw feature tensors bypass preprocessing. Padding side is the model's business, not the task's: causal decoders left-pad (so `output[:, -1]` is every row's real last token) and get mask-derived `position_ids` so an absolute-position model doesn't mispredict a short prompt padded up to a longer one; encoders keep right padding. Inputs that can't be padded into an `input_ids` batch — a raw feature tensor, a multimodal encoding — are carried straight to the model as a lone invoke, and asking to batch several of them raises rather than silently mangling them.
 
-```python
-# In Mediator.handle()
-if len(self.user_cache) > 0 and provider is not None:
-    for cache in self.user_cache:
-        cache.add(
-            provider,
-            self.interleaver.batcher.narrow(self.batch_group),
-        )
-```
+Full page: [docs/models/transformers-model.md](https://github.com/ndif-team/nnsight/blob/main/docs/models/transformers-model.md).
 
-#### Options
+### 7.4 DiffusionModel
 
-```python
-cache = tracer.cache(
-    include_inputs=True,   # Also cache inputs
-    include_output=True,   # Cache outputs (default)
-    modules=[model.transformer.h[0], model.transformer.h[1]],  # Specific modules only
-)
-```
+`DiffusionModel` (`modeling/diffusion.py`) wraps a `diffusers.DiffusionPipeline`. A diffusion pipeline is not itself a module — it orchestrates several (unet/transformer, vae, text_encoder, scheduler, ...) around a denoising loop — so nnsight wraps it in a `_PipelineModule` that registers each *module* component as a child and forwards a call to the pipeline's denoising loop. The result: each module component is an envoy (`model.unet` or `model.transformer`, `model.vae`, `model.text_encoder`, ...), and `model.output` / `tracer.result` is the pipeline's own image output object (read the images off its `.images`).
 
----
-
-### 5.11 Trace Result
-
-Access the final output of the traced function.
-
-#### Usage
-
-```python
-with model.trace("Hello") as tracer:
-    hidden = model.transformer.h[0].output[0].save()
-    
-    # Get the final output of the trace (model forward output)
-    result = tracer.result.save()
-
-print(result.logits.shape)
-```
-
-For generation:
-
-```python
-with model.generate("Hello", max_new_tokens=5) as tracer:
-    # Get the generated tokens
-    output = tracer.result.save()
-
-print(model.tokenizer.decode(output[0]))
-```
-
-ny traced function. It's cleaner than model-specific alternatives like `model.generator.output`.
-
----
-
-## 6. Modeling
-
-The `modeling/` directory provides convenience wrappers for common model types. It uses a **mixin architecture** to compose functionality.
-
-### Overview
-
-| Class | Purpose |
-|-------|---------|
-| `NNsight` | Base wrapper around any `torch.nn.Module` |
-| `LoadableMixin` | Adds `_load()` for loading models from identifiers |
-| `MetaMixin` | Adds lazy loading with `dispatch=True` |
-| `HuggingFaceModel` | Adds HuggingFace repo handling |
-| `TransformersModel` | Adds AutoConfig/AutoModel support |
-| `LanguageModel` | Full language model support with tokenizer |
-| `DiffusionModel` | Diffusion pipeline support |
-| `VLLM` | High-performance vLLM integration |
-
----
-
-### 6.1 Mixin Architecture
-
-The modeling classes use mixin inheritance to compose functionality:
-
-```
-NNsight (base.py)
-    └── Envoy
-
-LoadableMixin (mixins/loadable.py)
-    └── NNsight + _load() abstract method
-
-MetaMixin (mixins/meta.py)
-    └── LoadableMixin + _load_meta(), dispatch()
-
-RemoteableMixin (mixins/remoteable.py)
-    └── MetaMixin + remote execution support
-
-HuggingFaceModel (huggingface.py)
-    └── RemoteableMixin + repo_id, export/import edits
-
-TransformersModel (transformers.py)
-    └── HuggingFaceModel + AutoConfig, AutoModel
-
-LanguageModel (language.py)
-    └── TransformersModel + tokenizer, generation
-
-DiffusionModel (diffusion.py)
-    └── HuggingFaceModel + pipeline wrapping
-```
-
-#### LoadableMixin
-
-Provides the abstraction for loading models:
-
-```python
-class LoadableMixin(NNsight):
-    def __init__(self, *args, **kwargs):
-        if not isinstance(args[0], torch.nn.Module):
-            # Load from identifier (string, config, etc.)
-            model = self._load(*args, **kwargs)
-        else:
-            # Wrap existing module directly
-            model = args[0]
-        
-        super().__init__(model)
-    
-    def _load(self, *args, **kwargs) -> torch.nn.Module:
-        raise NotImplementedError()
-```
-
-This enables both patterns:
-
-```python
-# Load from HuggingFace
-model = LanguageModel("openai-community/gpt2")
-
-# Wrap existing model
-my_model = AutoModelForCausalLM.from_pretrained("gpt2")
-model = LanguageModel(my_model, tokenizer=tokenizer)
-```
-
-**⚠️ Common Error: Missing Tokenizer**
-
-When wrapping a pre-loaded model, you MUST provide the tokenizer:
-
-```python
-# WRONG - tokenizer not provided
-my_model = AutoModelForCausalLM.from_pretrained("gpt2")
-model = LanguageModel(my_model)  # Error!
-```
-
-**Error message:**
-```
-AttributeError: Tokenizer not found. If you passed a pre-loaded model to 
-`LanguageModel`, you need to provide a tokenizer when initializing: 
-`LanguageModel(model, tokenizer=tokenizer)`.
-```
-
-**Fix:**
-```python
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-my_model = AutoModelForCausalLM.from_pretrained("gpt2")
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
-model = LanguageModel(my_model, tokenizer=tokenizer)  # OK!
-```
-
-#### MetaMixin
-
-Provides lazy loading (dispatch) for large models:
-
-```python
-class MetaMixin(LoadableMixin):
-    def __init__(self, *args, dispatch: bool = False, **kwargs):
-        self.dispatched = False
-        
-        if isinstance(args[0], torch.nn.Module) or dispatch:
-            # Load immediately
-            self.dispatched = True
-            super().__init__(*args, **kwargs)
-        else:
-            # Create meta tensors (no memory allocation)
-            with init_empty_weights():
-                model = self._load_meta(*args, **kwargs)
-            NNsight.__init__(self, model)
-    
-    def dispatch(self):
-        # Load real weights
-        model = self._load(*self.args, **self.kwargs)
-        self._update(model)  # Sync Envoy tree
-        self.dispatched = True
-```
-
-Usage:
-
-```python
-# Lazy loading - fast initialization, no memory
-model = LanguageModel("meta-llama/Llama-3.1-8B")
-
-# Dispatch loads real weights
-model.dispatch()
-
-# Or auto-dispatch on first trace
-with model.trace("Hello"):  # Automatically dispatches
-    ...
-```
-
-The auto-dispatch happens in `interleave()`: if not dispatched and not scanning, it dispatches before running.
-
-**Important:** Models cannot be used with `torch.compile(fullgraph=True)` because fullgraph compilation doesn't allow hooks. NNsight patches generation configs to set `fullgraph=False`.
-
-#### The `__nnsight_<method>__` Pattern
-
-Model classes can override method behavior for tracing by defining `__nnsight_<method>__`:
-
-```python
-class LanguageModel:
-    def __nnsight_generate__(self, *args, **kwargs):
-        # Custom generation logic for tracing
-        # Sets up iteration tracking, streamers, etc.
-        ...
-```
-
-When you call `model.generate(...)` as a trace context, Envoy's `__getattr__` checks for `__nnsight_generate__` and uses it if present.
-
----
-
-### 6.2 Batching
-
-To support multiple invokes with different inputs in a single forward pass, model classes must implement batching.
-
-#### Abstract Methods
-
-The `Batchable` base class (from `intervention/batching.py`) defines:
-
-```python
-class Batchable:
-    def _prepare_input(self, *inputs, **kwargs):
-        """Normalize user input to a consistent format."""
-        return inputs, kwargs
-    
-    def _batch(self, batched_input, *args, **kwargs):
-        """Combine multiple invokes' inputs into one batch."""
-        raise NotImplementedError(
-            "Batching not implemented for this model"
-        )
-```
-
-**Without `_batch()` implemented, your model cannot use multiple invokes with inputs.**
-
-#### How Batching Works
-
-When you define multiple invokes:
-
-```python
-with model.trace() as tracer:
-    with tracer.invoke("Hello"):
-        ...
-    with tracer.invoke("World"):
-        ...
-```
-
-The `Batcher`:
-
-1. Calls `_prepare_input()` for each invoke's input
-2. Calls `_batch()` to combine them
-3. Tracks `batch_group` for each invoke: `[start_idx, batch_size]`
-4. During interleaving, `narrow()` extracts each invoke's slice
-
-#### LanguageModel Batching Example
-
-```python
-class LanguageModel:
-    def _prepare_input(self, *inputs, input_ids=None, **kwargs):
-        # Normalize to BatchEncoding
-        if isinstance(inputs[0], str):
-            inputs = self._tokenize(inputs[0])
-        return tuple(), {**inputs}
-    
-    def _batch(self, batched_inputs, **prepared_kwargs):
-        if batched_inputs is None:
-            # First invoke
-            return (tuple(), prepared_kwargs), len(prepared_kwargs["input_ids"])
-        
-        # Combine with padding
-        combined = self.tokenizer.pad([
-            *batched_inputs["input_ids"],
-            *prepared_kwargs["input_ids"],
-        ])
-        
-        return (tuple(), combined), len(prepared_kwargs["input_ids"])
-```
-
----
-
-### 6.3 LanguageModel
-
-`LanguageModel` is the primary class for HuggingFace language models.
-
-#### How LanguageModel Wraps Transformers
-
-`LanguageModel` is a thin wrapper around HuggingFace's `transformers` library. Under the hood, it uses `AutoModelForCausalLM.from_pretrained()` (or similar Auto classes) to load the model:
-
-```python
-# Internally, LanguageModel does something like:
-model = AutoModelForCausalLM.from_pretrained(repo_id, **kwargs)
-tokenizer = AutoTokenizer.from_pretrained(repo_id)
-```
-
-**Key insight:** All keyword arguments passed to `LanguageModel()` are forwarded directly to the HuggingFace loading function. This means you can use any parameter that `from_pretrained()` accepts:
-
-```python
-from nnsight import LanguageModel
-import torch
-
-model = LanguageModel(
-    "meta-llama/Llama-3.1-8B",
-    device_map="auto",                        # Accelerate device mapping
-    torch_dtype=torch.bfloat16,               # Model precision
-    trust_remote_code=True,                   # For custom model architectures
-    attn_implementation="flash_attention_2",  # Attention backend
-    dispatch=True,                            # NNsight-specific: load immediately
-)
-```
-
-The resulting model is identical to what you'd get from `transformers` directly, but enhanced with NNsight's intervention capabilities.
-
-#### The `device_map` Parameter
-
-`device_map="auto"` is a HuggingFace Accelerate feature that automatically distributes model layers across available devices:
-
-| Value | Behavior |
-|-------|----------|
-| `"auto"` | Distribute across all available GPUs; overflow to CPU if needed |
-| `"cuda"` | Load entire model onto default GPU |
-| `"cpu"` | Load entire model onto CPU |
-| `{"layer.0": 0, "layer.1": 1, ...}` | Custom per-layer device assignment |
-
-This is the recommended approach for large models that may not fit on a single GPU.
-
-#### Features
-
-| Feature | Description |
-|---------|-------------|
-| Automatic tokenization | Strings are tokenized automatically |
-| Padding | Left-padding by default for generation |
-| Generation support | `.generate()` works as a tracing context |
-| Iteration tracking | `max_new_tokens` sets iteration count |
-| Kwargs forwarding | All kwargs passed to HuggingFace `from_pretrained()` |
-
-#### Input Formats
-
-LanguageModel accepts many input formats:
-
-```python
-# String
-model.trace("Hello")
-
-# List of strings
-model.trace(["Hello", "World"])
-
-# Token IDs
-model.trace([1, 2, 3, 4])
-model.trace(torch.tensor([[1, 2, 3]]))
-
-# BatchEncoding (pre-tokenized)
-model.trace(tokenizer("Hello", return_tensors="pt"))
-
-# Dict
-model.trace({"input_ids": tensor, "attention_mask": mask})
-```
-
-#### Tokenizer Handling
-
-```python
-class LanguageModel:
-    def _load_tokenizer(self, repo_id, **kwargs):
-        if self.tokenizer is None:
-            # Default to left padding (for generation)
-            if "padding_side" not in kwargs:
-                kwargs["padding_side"] = "left"
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(repo_id, **kwargs)
-            
-            # Set pad token if missing
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-```
-
-#### Generation
-
-The `.generate()` method works as a tracing context:
-
-```python
-with model.generate("Hello", max_new_tokens=5) as tracer:
-    with tracer.iter[:]:
-        logits = model.lm_head.output.save()
-    
-    output = tracer.result.save()
-```
-
-The `__nnsight_generate__` method:
-
-1. Sets `default_all = max_new_tokens` for iteration tracking
-2. Injects a streamer for token-by-token access
-3. Wraps output through `self.generator` module
-4. Clears iteration tracking after completion
-
-#### The Generator Module
-
-`model.generator` is a wrapper module that captures the final generation output:
-
-```python
-class Generator(WrapperModule):
-    class Streamer(WrapperModule):
-        def put(self, *args):
-            return self(*args)
-        def end(self):
-            pass
-
-output = self.generator(output, hook=True)
-```
-
-**Note:** For new code, prefer `tracer.result` over `model.generator.output`.
-
----
-
-### 6.4 DiffusionModel
-
-`DiffusionModel` wraps diffusion pipelines for image generation.
-
-#### Architecture
-
-```python
-class Diffuser(WrapperModule):
-    def __init__(self, automodel, *args, **kwargs):
-        self.pipeline = automodel.from_pretrained(*args, **kwargs)
-        
-        # Expose pipeline components as submodules
-        for key, value in self.pipeline.__dict__.items():
-            if isinstance(value, torch.nn.Module):
-                setattr(self, key, value)
-```
-
-This exposes components like `unet`, `text_encoder`, `vae` as traceable modules.
-
-#### Usage
+Both `trace` and `generate` run the *whole* pipeline, interventions firing on every component the denoising loop invokes; they differ only in the default step count. `trace` defaults to `num_inference_steps=1` — a fast one-step pass for inspecting or editing activations — while `generate` uses the pipeline's own default. Use `tracer.iter` to target a particular inference step.
 
 ```python
 from nnsight import DiffusionModel
 
-model = DiffusionModel("stabilityai/stable-diffusion-2-1")
-
-with model.generate("A cat sitting on a mat", num_inference_steps=50) as tracer:
-    # Access UNet at each denoising step
-    with tracer.iter[:] as step:
-        unet_out = model.unet.output.save()
-    
-    output = tracer.result.save()
-
-output.images[0].save("cat.png")
+# Install diffusers first. This small public checkpoint is for API checks.
+model = DiffusionModel("hf-internal-testing/tiny-stable-diffusion-torch", safety_checker=None)
+with model.generate("a photo of a cat", num_inference_steps=2, seed=0) as tracer:
+    latents = model.unet.output[0].save()
+    images = tracer.result.save()
+images.images[0]
 ```
 
-#### Multi-Step Diffusion
+Reproducibility goes through `seed=`: passed to `generate`, an int seed becomes a reproducible `torch.Generator` — a per-image list for a batch, so each image is independently reproducible — while passing `generator=` directly overrides it. Multi-prompt invokes batch via the `DiffusionBatcher` described in 7.2, which handles the classifier-free-guidance doubling and `num_images_per_prompt` expansion. To run one component's forward on its own rather than the whole pipeline, trace that envoy directly: `with model.unet.trace(sample, timestep, encoder_hidden_states=...):`.
 
-The `num_inference_steps` parameter sets the iteration count:
+Loading follows the same lazy pattern as the HuggingFace base, but the meta build is assembled component-by-component: a pipeline can't be loaded weightless, so each module component is built from its config on meta while the light components (schedulers, tokenizers, processors) load normally on a real device, and a meta pipeline of the same shape is assembled from them. Resolving each component's class handles the `[library, class_name]` spec in `model_index.json`, including Flax/TF class names (mapped to their PyTorch equivalents) and diffusers pipeline-subpackage components (e.g. a safety checker). Requires the optional `diffusers` package. Full page: [docs/models/diffusion-model.md](https://github.com/ndif-team/nnsight/blob/main/docs/models/diffusion-model.md).
 
-```python
-with model.generate("A landscape", num_inference_steps=30) as tracer:
-    noise_preds = list().save()
-    
-    with tracer.iter[:] as step:
-        # Intervene on specific steps
-        if step < 10:
-            # Early denoising - high-level structure
-            model.unet.output[:] *= 1.1
-        
-        noise_preds.append(model.unet.output.clone())
-```
+### 7.5 VLLM
 
-#### Key Points
+`VLLM` (`modeling/vllm/vllm.py`) is the high-throughput runtime — PagedAttention, continuous batching, tensor parallelism, and optional async streaming, with arbitrary Python interventions written exactly as for any other model. It is a large subsystem; this is the orientation, and [docs/models/vllm.md](https://github.com/ndif-team/nnsight/blob/main/docs/models/vllm.md) plus [docs/developing/vllm-integration.md](https://github.com/ndif-team/nnsight/blob/main/docs/developing/vllm-integration.md) are the reference.
 
-- `__call__` goes to `unet` directly (main compute module)
-- `__nnsight_generate__` wraps the pipeline call
-- `default_all` is set to `num_inference_steps` for iteration
+The defining constraint is that vLLM runs the model in its own worker process. This client process holds only a meta-device copy of the module tree, with no weights to hook, so a trace cannot simply run alongside the forward the way it does locally. Instead the intervention travels *to* the model: each invoke's worker is serialized into its request's `SamplingParams.extra_args`, rides vLLM's own request pipeline into the worker, is deserialized there, run against the real module, and its saved values shipped back. Two things follow. Interventions are scoped to a *request*, so each `tracer.invoke(...)` carries exactly one prompt — several prompts means several invoke blocks, not a list. And sampling settings (`temperature`, `max_tokens`, `top_p`, ...) are passed to `trace`/`invoke` rather than configured on the model, since each invoke is its own vLLM request.
 
----
-
-### 6.5 vLLM
-
-vLLM integration provides high-performance inference with NNsight interventions. This is one of the most complex integrations due to vLLM's optimized architecture.
-
-#### High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  User Code                                              │
-│  with model.trace("Hello") as tracer:                   │
-│      logits = model.logits.output.save()                │
-└──────┬─────────────────────────────────────────────────┘
-       |                
-       ▼
-┌─────────────────────────────────────────────────────────┐
-│  VLLM Class                                             |
-|  - Instantiates empty 'meta' model                      │
-│  - Creates NNsightSamplingParams with serialized        │
-│    Mediator attached                                    │
-│  - Sends prompts + params to vLLM engine                │
-└───────┬───────────────────────────────────────▲─────────┘
-        │                                       |
-        |                                       |
-┌───────▼──────────────────────────────────────────────────────────────────┐
-│  NNsightLLMEngine                                                        |
-|       |            - Sends final result back to NNsightGPUModelRunner    |
-|       |              for interleaving and gathering saved values         |
-└───────|──────────────────────────────────────────────▲───────────────────┘
-        │                                              |
-        |                                              |
-┌───────▼──────────────────────────────────────────────▼──────────────────────────────────────────────────────┐
-|  NNsightGPUModelRunner - Pre-wrapped NNsight model                                                          │
-│  - Deserializes Mediator from SamplingParams          finish_nnsight()                                      │
-│  - Manages batch groups (flat ↔ unflatten)            4.) Lets intervention code interact with final output │
-│  - Runs interleaving at multiple phases               - Collects saved values                               |
-|    1.) Forward Pass                                   - Handles continuous batching cleanup                 |
-|    2.) Logits                                                                                               |
-|    3.) Sampling                                                                                             |
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### Usage
+You read generated tokens through `model.logits` and `model.samples` — `eproperty` hookable values (the same descriptor behind `.output`/`.input`; see [Extending nnsight](#10-extending-nnsight)) exposing this step's pre-sampling logits and the token ids drawn from them — and the whole finished request through `tracer.result`. `mode="sync"` (default) builds a `vllm.LLM`; `mode="async"` builds vLLM's streaming `AsyncLLM`, and a trace then yields outputs as they generate via `async for output in tracer.backend`, with saves arriving on the finished output's `.saves[...]`. Tensor parallelism is handled by a VLLM-specific batcher that maps each worker onto its own tokens within the flat `[total_tokens, hidden]` slab the scheduler packs. Needs the optional `vllm` extra.
 
 ```python
 from nnsight.modeling.vllm import VLLM
 
-model = VLLM("gpt2", tensor_parallel_size=1, dispatch=True)
-
-with model.trace("Hello", temperature=0.0, max_tokens=5) as tracer:
-    logits = list().save()
-    
-    with tracer.iter[:]:
-        logits.append(model.logits.output)
-    
-    output = tracer.result.save()
-
-print(output)
+model = VLLM("openai-community/gpt2", dispatch=True, dtype="float16",
+             gpu_memory_utilization=0.3, max_model_len=64)
+with model.trace("The Eiffel Tower is in", temperature=0.0, max_tokens=1):
+    model.transformer.h[8].output[:] = 0
+    logits = model.logits.clone().save()
 ```
+
+### 7.6 Deprecated aliases
+
+Two names remain for backwards compatibility and warn (`DeprecationWarning`) on construction:
+
+- **`LanguageModel`** (`modeling/language.py`) — a `TransformersModel` pinned to `task="text-generation"`. It adds nothing of its own beyond accepting `tokenizer_kwargs` at load (apply the same settings to `model.tokenizer` yourself — `padding_side` is the usual one). Use `TransformersModel(repo_id, task="text-generation")`.
+- **`VisionLanguageModel`** (`modeling/vlm.py`) — a `TransformersModel` pinned to `task="image-text-to-text"`, taking a prompt and images by keyword (`text=`, `images=`) and running the processor over them before the model's own `generate`. Use `TransformersModel(repo_id, task="image-text-to-text")`.
+
+Both share `TransformersModel`'s remote key (via `_remoteable_class`), so a model deployed as a `TransformersModel` is reachable whether a client wraps it as the base class or either alias. The diffusion class is `DiffusionModel` — there is no separate `DiffusersModel` to migrate from. Pages: [docs/models/language-model.md](https://github.com/ndif-team/nnsight/blob/main/docs/models/language-model.md), [docs/models/vision-language-model.md](https://github.com/ndif-team/nnsight/blob/main/docs/models/vision-language-model.md).
 
 ---
 
-#### Model Loading
+The [cookbook API guide](llms.md#other-nnsight-08-features) also covers quantization, Transformers tensor parallelism, PEFT loading, and the expanded pipeline tasks. Its [vLLM section](llms.md#vllm-integration) includes CUDA graph taps and persistent engine edits. These optional integrations require their own dependencies and hardware; they are not enabled by a plain local installation.
 
-vLLM loads models through its own infrastructure. NNsight wraps the loaded model:
+## 8. Debugging
 
-```python
-class NNsightGPUModelRunner(GPUModelRunner):
-    def load_model(self, *args, **kwargs):
-        # vLLM loads the model normally
-        super().load_model(*args, **kwargs)
-        
-        # Wrap in NNsight
-        self.nnsight_model = VLLM(self.model)
-        
-        # Use vLLM-specific batcher
-        self.nnsight_model._interleaver.batcher = VLLMBatcher()
-        
-        # Add tensor parallelism hooks
-        self.nnsight_model._interleaver.batcher.wrap(self.nnsight_model)
-```
+Intervention code is deferred and interleaved: nnsight captures the body of your
+`with model.trace(...):` block, compiles it, and runs it in a greenlet worker
+that trades control back and forth with the model's forward pass (see
+[Interleaving](#4-interleaving)). That indirection is what makes debugging feel
+different from ordinary Python — the line that raises did not run where you wrote
+it, and by the time an exception surfaces it has passed through nnsight's controller
+and the model's own frames. The three subsections below cover how nnsight keeps
+that machinery out of your way when something goes wrong: tracebacks that point
+at your code, a single switch that puts the plumbing back when you need to see
+it, and the handful of errors you will actually hit.
 
-The `VLLMBatcher.wrap()` adds hooks to all modules specifically for handling tensor parallelism (explained below).
+### 8.1 Clean tracebacks
 
----
-
-#### Mediator Transport via SamplingParams
-
-The challenge: Mediators (intervention code) are created in user code but must execute inside vLLM's model runner, potentially on different processes.
-
-**Solution:** Attach mediators to vLLM's `SamplingParams`:
+For a local trace, **an exception raised inside the trace
+body is the real exception**. There is no wrapper class, no `.original`
+attribute, no dynamically synthesized `NNsightException`. If layer indexing
+raises `IndexError`, you catch `IndexError`; if your arithmetic raises
+`ValueError`, that is what propagates. The type is preserved within the local
+process; deferred errors crossing a process boundary are described below:
 
 ```python
-class NNsightSamplingParams(SamplingParams):
-    mediator: Optional[Mediator | bytes] = None
-    
-    def __reduce__(self):
-        state = structs.asdict(self)
-        
-        # Serialize mediator for transport
-        if isinstance(self.mediator, Mediator):
-            state["mediator"] = save(self.mediator)
-        
-        return (rebuild, (state,))
+try:
+    with model.trace("Hello"):
+        h = model.transformer.h[100].output.save()   # only 12 layers: invalid module index
+except (IndexError, AttributeError) as error:
+    print(type(error).__name__)   # AttributeError in 0.8.0rc1
 ```
 
-When a trace is created:
-1. Intervention code is compiled into a Mediator
-2. Mediator is serialized to bytes
-3. Bytes are attached to `NNsightSamplingParams`
-4. vLLM passes SamplingParams through its pipeline
-5. Model runner deserializes and executes the Mediator
+What nnsight does adjust is the *traceback*, not the exception. A raw traceback
+from a worker is buried under nnsight's own frames — the interleaver, the
+mediator, the module controllers — plus the model's forward stack. So when a trace
+body raises, `clean_traceback` (`src/nnsight/tracing/util.py`) rebuilds the
+traceback keeping only the frames whose source file lives *outside* the nnsight
+package, leaving your own frames across whatever files your intervention code
+spans. The plumbing is stripped by default; the error points at the line you
+wrote.
+
+nnsight also works to point at the *right* line. When a worker raises, the
+mediator stashes an intervention-only traceback on the exception (as
+`__intervention_tb__`) before the model and controller frames pile on during
+unwinding, so the surfaced trace can name the exact intervention line rather than
+the deepest model frame. This matters most for the deferred-worker path (remote
+and vLLM), where the error is reduced to a wire-safe dict in one process and
+re-raised in another (see `src/nnsight/intervention/errors.py`): a deferred
+worker error comes back as a `RuntimeError` carrying the original type name,
+message, and that intervention traceback, because reconstructing the original
+exception class across a process boundary is brittle.
+
+### 8.2 DEBUG mode and `-v`
+
+Sometimes the bug *is* in the plumbing — or you want to see every frame anyway.
+`CONFIG.APP.DEBUG` (in `src/nnsight/schema/config.py`) is the single switch that
+turns clean tracebacks off, and it does two things:
+
+1. **Full tracebacks.** With `DEBUG` on, `clean_traceback` strips nothing: the
+   whole stack, nnsight internals included, is shown. Turn it on when you suspect
+   the fault is in nnsight rather than your intervention code.
+2. **Verbose remote logging.** `RemoteBackend` sets `self.verbose = verbose or
+   CONFIG.APP.DEBUG`, so remote runs log payload and result byte sizes and print
+   each status update on its own line instead of collapsing into one in-place
+   spinner (see [Remote execution](#9-remote-execution)).
+
+There are four ways to enable it, matching how you tend to run code:
 
 ```python
-# In model runner
-if isinstance(new_req.sampling_params.mediator, bytes):
-    new_req.sampling_params.mediator = load(
-        new_req.sampling_params.mediator, model
-    )
+import nnsight
+nnsight.CONFIG.APP.DEBUG = True          # this process
 ```
 
----
-
-#### Batch Group Management
-
-vLLM uses a **flat tensor format** for efficiency. Standard NNsight uses `[batch, tokens, hidden]`, but vLLM uses `[total_tokens, hidden]` where all tokens from all prompts are concatenated.
-
-**The Problem:**
-
-```
-Standard NNsight:
-  Prompt 1: [1, 5, 768]  →  batch_group = [0, 1]
-  Prompt 2: [1, 3, 768]  →  batch_group = [1, 1]
-
-vLLM (flat):
-  All tokens: [8, 768]   →  batch_group = [0, 5] for prompt 1
-                             batch_group = [5, 3] for prompt 2
+```bash
+NNSIGHT_DEBUG=1 python your_script.py    # environment variable
+python your_script.py -v                 # or --verbose
 ```
 
-**Solution:** Track batch groups differently during forward pass vs. after sampling:
+The command-line form is a plain `sys.argv` scan performed once at import
+(`Config._from_cli`), checking for `-v` or `--verbose` anywhere in the launching
+command. It is deliberately dumb: any launcher that happens to pass `-v` turns
+debug mode on too, so a run under `pytest -v` executes with full tracebacks and
+verbose remote logging.
+
+To make it stick, persist it to the user config file:
 
 ```python
-class NNsightRequestHelper:
-    def process_new_reqs(self, new_reqs, model):
-        for new_req in new_reqs:
-            mediator = new_req.sampling_params.mediator
-            batch_size = len(new_req.prompt_token_ids)  # Token count
-            
-            # Batch group is [start_token, num_tokens] during forward
-            batch_start = sum(model._interleaver.batcher.last_batch_group)
-            mediator.batch_group = [batch_start, batch_size]
-    
-    def unflatten(self, model):
-        # After forward, switch to [start_prompt, num_prompts]
-        batch_start = 0
-        for mediator in model._interleaver.mediators:
-            num_prompts = self.num_prompts_in_mediator[mediator]
-            mediator.batch_group = [batch_start, num_prompts]
-            batch_start += num_prompts
+nnsight.CONFIG.APP.DEBUG = True
+nnsight.CONFIG.save()                    # writes ~/.config/nnsight/config.yaml
 ```
 
-This allows:
-- During forward pass: interventions work on token-level tensors
-- After sampling: interventions work on prompt-level outputs
+Debug output is noisy — payload sizes and a per-status timeline on every remote
+run — so turn it back off for clean output once you are done. A related switch,
+`CONFIG.APP.REMOTE_LOGGING` (default `True`), controls the status display
+independently of `DEBUG`; see [Configuration](#92-configuration). Full settings
+reference: `docs/reference/config.md`; the traceback details:
+`docs/errors/debug-mode.md`.
 
----
+### 8.3 Common errors
 
-#### Multiple Interleaving Phases
+These are the errors you will actually meet, each with its cause and its fix. The
+full map lives in `docs/errors/index.md`; local traces preserve the exception
+class, while deferred cross-process errors may wrap it as described in §8.1.
 
-vLLM separates execution into distinct phases. NNsight interleaves at each:
+**`OutOfOrderError` — "`'<location>'` was requested but the model already ran
+past it."** Each block of intervention code runs in its own worker that is served
+locations *in the order the model reaches them*, holding one pending request at a
+time. Ask for layer 1's output after layer 5's and layer 1 has already fired and
+gone; the worker is left parked, and at the end of the run
+`Interleaver.check_dangling_mediators` throws `OutOfOrderError` into it so the
+traceback lands on the exact waiting line. Two flavors share this one class:
+
+- *Wrong order.* Reading modules out of forward-pass order within one block. Fix:
+  lay your reads out top-to-bottom in the order modules run (the order in
+  `print(model)`), or split the out-of-order reads across separate invokes —
+  each invoke is its own worker with an independent access order.
+- *Never reached.* The model finished with a worker still waiting for a location
+  that never fired — a module skipped under `model.eval()`, a branch not taken, a
+  submodule of a `.skip()`-ped module. (An `iter` loop that outran the model is
+  the warning flavor of the same unwind, not this error.) Confirm a module
+  actually fires with `model.scan(...)` before reading it.
+
+The `.i<n>` suffix on the location is the occurrence tag — which visit of that
+location the request targets; `.i0` outside iteration, counting up per step
+inside a generation loop. Import it from `nnsight.intervention.interleaver` to
+catch it. (`docs/errors/out-of-order-error.md`,
+`docs/errors/value-was-not-provided.md`.)
+
+**`Cannot access '<location>' outside of interleaving`** (a `ValueError`).
+Reading or writing an Envoy value — `.output`, `.input`, `.inputs`, `.source` —
+when no trace is running. Envoy properties resolve through the worker driving the
+current intervention, and intervention code only runs *while interleaving*, so no
+worker means there is nothing to park on and nothing to answer with. Assigning to
+one gives the same message, since a swap goes through the same check. You hit this
+by reading a value after the block exited without saving it, or from a closure
+that captures an Envoy and runs later. It also fires inside the body of an
+invoke-mode trace, which runs inline only to collect its invokes — the reads
+belong inside a `tracer.invoke(...)` block. Fix: read inside the trace and
+`.save()` what you need afterward (see [Saving values](#61-saving-values)).
+(`docs/errors/cannot-access-outside-interleaving.md`.)
+
+**`trace() needs an input, or at least one 'with tracer.invoke(...)' block`** (a
+`ValueError`). A `with model.trace() as tracer:` with no direct input *and* no
+`tracer.invoke(...)` block has no batch to run on. Give `trace()` an input
+directly, or add at least one invoke.
+(`docs/errors/cannot-access-outside-interleaving.md`.)
+
+**`save() was called outside a trace`** (a `ValueError`). `.save()` and
+`nnsight.save(x)` mark a value to be returned when the outermost trace exits,
+which only means something inside a trace. Calling it before the block —
+`acts = nnsight.save([])` on the line *above* `with model.trace(...)` — marks
+into a saved set that is cleared before anything reads it, so it is an explicit
+error rather than a silent no-op. Move the save inside the block, and build any
+accumulator there:
 
 ```python
-def execute_model(self, scheduler_output, intermediate_tensors=None):
-    # Phase 1: Model forward pass
-    with self.nnsight_model._interleaver:
-        super().execute_model(scheduler_output, intermediate_tensors)
-        
-        # Switch batch groups from tokens to prompts
-        self.nnsight_request_helper.unflatten(self.nnsight_model)
-        
-        # Phase 2: Logits (hooked separately)
-        logits = self.model.logits(self.execute_model_state.logits, hook=True)
-
-def _sample(self, *args, **kwargs):
-    # Phase 3: Sampling
-    with self.nnsight_model._interleaver:
-        sampler_output = super()._sample(*args, **kwargs)
-        
-        # Hook sampled tokens
-        sampler_output.sampled_token_ids = self.model.samples(
-            sampler_output.sampled_token_ids, hook=True
-        )
-
-def finish_nnsight(self, finished_requests):
-    # Phase 4: Final output
-    with self.nnsight_model._interleaver:
-        finished_requests[0] = self.nnsight_model._interleaver.handle(
-            "result", finished_requests[0]
-        )
+with model.trace("Hello"):
+    acts = nnsight.save([])                          # accumulator, saved inside
+    acts.append(model.transformer.h[0].output)
 ```
 
-**Wrapper Modules:**
+(`docs/errors/save-outside-trace.md`; the internal `mark()` is the same mechanism
+without the guard, for backends recording a finished request's values.)
 
-Like `Generator` in LanguageModel, VLLM has wrapper modules for key outputs:
+**The over-running loop drops-trailing-code warning.** A
+`for step in tracer.iter[...]:` loop (or `tracer.all()`) that outruns the model
+leaves the final over-run request dangling; because the worker is inside an
+iteration loop, nnsight *warns* rather than raising, unwinding the loop to run
+its `finally` blocks and keeping values from the steps that were reached. The
+catch is that unwinding drops the loop *and every line after it* — so a
+`tracer.result.save()` placed after an over-running loop never runs. When you
+need code to execute after the loop, bound it and hold the run to that count
+(`min_new_tokens=N`); full treatment in [Iteration](#63-iteration).
 
-| Module | Access | Description |
-|--------|--------|-------------|
-| `model.logits` | `model.logits.output` | Final logits before sampling |
-| `model.samples` | `model.samples.output` | Sampled token IDs |
+## 9. Remote execution
+
+Everything you have written so far runs the same trace whether the weights sit on
+your GPU or on someone else's. That is the whole idea behind remote execution:
+you build the model locally on the meta device — its architecture constructed so
+`model.transformer.h[0].output` is a real Envoy path, but no weights allocated —
+write ordinary intervention code against it, and ship the *serialized trace* to a
+server that holds the real weights. The model never travels; your code does. This
+section covers where it runs (NDIF), how to configure it, and the four ways to
+wait for a job, ending with the in-process dry run that proves your trace will
+ship.
+
+### 9.1 NDIF
+
+NDIF — the National Deep Inference Fabric — is a hosted service that runs nnsight
+intervention code on shared GPU pods. It exists so you can trace models that will
+never fit on your hardware: Llama-3.1-70B and 405B, DeepSeek, and the like. You
+instantiate the wrapper locally (on meta, no GPU, no download), and NDIF
+deserializes your trace on a server that holds the weights, runs the forward pass
+with your interventions spliced in, and streams the results back.
+
+What crosses the wire is the trace, serialized *source and all*: the captured
+block, every function and class it references, and any registered local modules
+are reduced to source plus their referenced globals and locals and pickled
+(zstd-compressed when `CONFIG.API.COMPRESS` is on). The model itself is never
+serialized — it is named by a `model_key` and must already be deployed on NDIF.
+Because the whole thing ships as source, anything your block touches must be
+importable on the server or shipped by value; local-only modules are registered
+automatically (see [remote="local"](#96-remotelocal) and
+`docs/remote/register-local-modules.md`).
+
+A submitted job moves through a lifecycle you watch as status updates:
+`RECEIVED` (validated and accepted) → `QUEUED` (waiting in the model's queue) →
+`PROVISIONING`/`DEPLOYING` (capacity coming up) → `DISPATCHED` (handed to a
+deployment) → `RUNNING` (forward pass on the GPU) → `COMPLETED` (saves ready to
+download) or `ERROR` (a server-side exception, surfaced locally as `RemoteError`
+with the remote traceback). A `LOG` update carries a `print(...)` from inside
+your block — a transient message, not a lifecycle stage. Only values you
+`.save()` come back; everything else is local to the server run and discarded.
+(`docs/remote/ndif-overview.md`.)
+
+### 9.2 Configuration
+
+Every remote request is keyed against an NDIF API key, and both the key and the
+host live on the `CONFIG` singleton (`src/nnsight/schema/config.py`). The key
+sits at `CONFIG.API.APIKEY`, the base URL at `CONFIG.API.HOST` (default
+`https://api.ndif.us`; the websocket URL is derived, `https://` → `wss://`).
+
+The canonical way to set the key is once per machine:
 
 ```python
-with model.trace("Hello", max_tokens=5) as tracer:
-    with tracer.iter[:]:
-        # Access logits at each step
-        step_logits = model.logits.output.save()
-        
-        # Access sampled tokens
-        tokens = model.samples.output.save()
+from nnsight import CONFIG
+CONFIG.set_default_api_key("YOUR_KEY")   # sets APIKEY and persists it
 ```
 
----
+`set_default_api_key` assigns the key and calls `CONFIG.save()`. There are two
+other paths: the `NDIF_API_KEY` environment variable (read at import, overriding
+the on-disk value), and — in Colab — a Userdata secret named `NDIF_API_KEY`,
+read as a fallback when neither the env var nor a file key is set.
 
-#### Tensor Parallelism
+Config is layered, later winning: **shipped defaults < user config file <
+environment**. The user file lives at `$XDG_CONFIG_HOME/nnsight/config.yaml`
+(default `~/.config/nnsight/config.yaml`), or wherever `$NNSIGHT_CONFIG` points.
+Keeping it under `~/.config`, separate from the package's shipped
+`config.yaml`, is deliberate: upgrading nnsight cannot clobber your saved key.
+`CONFIG.save()` writes the current values back to the *user* file, never the
+shipped one.
 
-When using `tensor_parallel_size > 1`, tensors are sharded across GPUs. NNsight must ensure intervention code sees **complete, unsharded tensors**.
+Two `CONFIG.APP` switches shape remote runs beyond `DEBUG` (see
+[DEBUG mode and `-v`](#82-debug-mode-and--v)):
 
-**The Challenge:**
+- `CONFIG.APP.PYMOUNT` (default `True`) mounts `.save()` onto every object so
+  `value.save()` works in a trace. When it is `False` — or the optional C
+  extension that mounts it did not build — use `nnsight.save(value)` instead.
+  Mounting adds `.save` to all objects process-wide, so anything checking
+  `hasattr(x, "save")` will see it.
+- `CONFIG.APP.REMOTE_LOGGING` (default `True`) shows the live status display and
+  the download progress bar. Set it `False` for silent runs.
 
-vLLM uses two types of parallel linear layers:
+To target a different deployment, set `CONFIG.API.HOST` (persistently, or via the
+`NDIF_HOST` env var), or override per call by passing the host URL as `remote=`;
+the URL must start with `http://` or `https://`. (`docs/remote/api-key-and-config.md`,
+`docs/reference/config.md`.)
 
-| Layer Type | Sharding | Behavior |
-|------------|----------|----------|
-| `ColumnParallelLinear` | Output sharded across GPUs | Each GPU has `1/N` of output columns |
-| `RowParallelLinear` | Input sharded, output reduced | Each GPU processes `1/N` of input |
+### 9.3 Blocking and non-blocking
 
-**The Solution: Gather → Intervene → Reshard**
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  GPU 0                          GPU 1                               │
-│  ┌─────────┐                    ┌─────────┐                         │
-│  │ Shard 0 │                    │ Shard 1 │   ← Sharded tensor      │
-│  └────┬────┘                    └────┬────┘                         │
-│       │                              │                              │
-│       ▼                              ▼                              │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │              all_gather() - collect all shards              │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│       │                              │                              │
-│       ▼                              ▼                              │
-│  ┌───────────────┐              ┌───────────────┐                   │
-│  │ Full Tensor   │              │ Full Tensor   │   ← Complete      │
-│  │ [all shards]  │              │ [all shards]  │     (identical)   │
-│  └───────┬───────┘              └───────┬───────┘                   │
-│          │                              │                           │
-│          ▼                              ▼                           │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │           Intervention code runs (identical on all GPUs)    │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│          │                              │                           │
-│          ▼                              ▼                           │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │              split() - re-shard for forward pass            │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│          │                              │                           │
-│          ▼                              ▼                           │
-│  ┌─────────┐                    ┌─────────┐                         │
-│  │ Shard 0 │                    │ Shard 1 │   ← Sharded again       │
-│  └─────────┘                    └─────────┘                         │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-**Implementation:**
-
-`VLLMBatcher` wraps all modules to track the current module and whether tensors are sharded:
+`model.trace(input, remote=True)` is the simplest remote run. It is the same
+`trace` you call locally — the block is captured on `__exit__`, serialized, and
+handed to a `RemoteBackend`. In the default **blocking** mode the client holds one
+`/subscribe` websocket open: it takes a session id, POSTs the payload to
+`/request`, reads status updates off the socket until `COMPLETED`, downloads the
+result from a presigned URL, and pushes the saved values back into your frame so
+your `h = ...save()` variables populate — exactly as a local trace would.
 
 ```python
-class VLLMBatcher(Batcher):
-    def wrap(self, model):
-        def pre_input_hook(module, args, kwargs):
-            self.current_module = module
-            self.type = "input"
-            
-            if isinstance(module, RowParallelLinear):
-                self.parallel = module.input_is_parallel
-        
-        def pre_output_hook(module, args, output):
-            self.current_module = module
-            self.type = "output"
-            
-            if isinstance(module, ColumnParallelLinear):
-                self.parallel = not module.gather_output
+from nnsight import TransformersModel
+
+model = TransformersModel("openai-community/gpt2", task="text-generation", dispatch=True, attn_implementation="eager")
+with model.trace("The Eiffel Tower is in the city of", remote=REMOTE):
+    logit = model.lm_head.output[0, -1].argmax(-1).save()
+print(model.tokenizer.decode(logit))
 ```
 
-When a mediator requests data, `check_gathered()` gathers if needed:
+For a job you do not want to block on, pass `blocking=False`. This swaps to
+fire-and-poll: the trace's `__exit__` submits the request over plain HTTP (no
+websocket — the server records each status to its object store) and returns
+immediately, leaving the backend holding a `job_id`. Each later call to the
+backend polls `GET /response/{job_id}`, returning `None` while the job is still
+running and the saves dict on `COMPLETED`:
 
 ```python
-def check_gathered(self):
-    if self.parallel and not self.gathered:
-        if isinstance(self.current_module, ColumnParallelLinear):
-            if self.type == "output":
-                # Gather sharded output
-                self.current_value = tensor_model_parallel_all_gather(
-                    self.current_value
-                )
-        
-        elif isinstance(self.current_module, RowParallelLinear):
-            if self.type == "input":
-                # Gather sharded input
-                self.current_value = tensor_model_parallel_all_gather(
-                    self.current_value
-                )
-            elif self.type == "output":
-                # Reduce partial outputs
-                self.current_value = tensor_model_parallel_all_reduce(
-                    self.current_value
-                )
-        
-        self.gathered = True
+import time
+
+with model.trace("Hello", remote=True, blocking=False) as tracer:
+    output = model.lm_head.output.save()
+
+backend = tracer.backend        # the RemoteBackend, now holding the job id
+while True:
+    result = backend()          # None until COMPLETED, then the saves dict
+    if result is not None:
+        break
+    time.sleep(1)
+
+print(result["output"].shape)
 ```
 
-After intervention code runs, post-hooks **reshard** the tensor:
+The result dict is keyed by the **saved variable's name** in your trace — in the
+non-blocking and async paths the trace has long since exited, so nothing is
+pushed into a frame; you read `result["output"]`. Because there is no background
+polling thread, each `backend()` call fetches only whatever status the server
+last recorded — poll once after a long wait and you may jump straight from
+`RECEIVED` to the result, observing no intermediate states. If you stored a
+`job_id`, you can construct a poll-only backend later
+(`RemoteBackend(model.to_model_key(), blocking=False, job_id="...")`) and fetch
+the result without resubmitting. (`docs/remote/remote-trace.md`,
+`docs/remote/non-blocking-jobs.md`.)
+
+### 9.4 Async
+
+`AsyncRemoteBackend` waits for a job on an asyncio event loop rather than blocking
+a thread or polling by hand. Submission is still synchronous — the backend
+subscribes, takes the session id, and POSTs the payload inside the trace's
+`__exit__` — but only the *waiting* is async, so the loop stays free while the job
+runs. Construct one and pass it as the trace's `backend`, then `await` it for the
+saves dict:
 
 ```python
-def post_output_hook(module, args, output):
-    if self.parallel and self.gathered:
-        if isinstance(self.current_module, ColumnParallelLinear):
-            # Split back to shards
-            output = split_tensor_along_last_dim(
-                output, num_partitions=module.tp_size
-            )[module.tp_rank].contiguous()
-        
-        elif isinstance(self.current_module, RowParallelLinear):
-            # Undo all_reduce by dividing
-            output = output / module.tp_size
-    
-    return output
+import asyncio
+from nnsight import TransformersModel
+from nnsight.intervention.backends.remote import AsyncRemoteBackend
+
+model = TransformersModel("openai-community/gpt2", task="text-generation", dispatch=True)
+
+async def main():
+    backend = AsyncRemoteBackend(model.to_model_key())
+    with model.trace("The Eiffel Tower is in the city of", backend=backend):
+        logit = model.lm_head.output[0][-1].argmax(dim=-1).save()
+    result = await backend                       # wait for COMPLETED, get the saves
+    print(model.tokenizer.decode(result["logit"]))
+
+asyncio.run(main())
 ```
 
-**Key Insight:** Every GPU runs the **same intervention code** on the **same complete tensor**. This ensures interventions are consistent across the distributed system.
+`await backend` renders the status display and raises `RemoteError` on a server
+error, just like the blocking parent; the result is a dict keyed by your saved
+variable names. Because the websocket `recv` is blocking, it runs through
+`asyncio.to_thread`, so several backends awaited together with `asyncio.gather`
+all make progress at once.
 
----
-
-#### Continuous Batching Support
-
-vLLM uses continuous batching: new requests join and finished requests leave mid-execution. NNsight handles this by continuously updating batch groups:
+The other form, `async for update in backend`, hands you each raw `ResponseModel`
+status update as it lands and then the **saves dict as the final item**. This
+form does *not* touch the display and does *not* raise on `ERROR` — an `ERROR`
+simply ends the stream, and you inspect it and raise yourself if you want. Tell
+the two apart by type: every status update is a `ResponseModel`, the single final
+item is a plain `dict`:
 
 ```python
-def process_finished_reqs(self, finished_request_ids, requests, model):
-    batch_start = 0
-    seen_mediators = set()
-    
-    for req_id, req in requests.items():
-        if req_id in finished_request_ids:
-            continue  # Skip finished
-        
-        mediator = req.sampling_params.mediator
-        
-        if mediator in seen_mediators:
-            mediator.batch_group[1] += 1  # Increment size
+async def collect_updates(backend):
+    result = None
+    async for update in backend:
+        if isinstance(update, dict):
+            result = update
         else:
-            seen_mediators.add(mediator)
-            mediator.batch_group = [batch_start, 1]  # New group
-        
-        batch_start += 1
-```
-
-When requests finish, `finish_nnsight()`:
-1. Runs final interleaving for the "result" phase
-2. Collects saved values from mediator frames
-3. Cancels the mediator
-4. Updates batch groups for remaining requests
-
-```python
-def finish_nnsight(self, finished_requests):
-    # Let interventions interact with final output
-    with self.nnsight_model._interleaver:
-        finished_requests[0] = self.nnsight_model._interleaver.handle(
-            "result", finished_requests[0]
-        )
-    
-    # Collect saved values
-    result = {}
-    for req in finished_requests:
-        mediator = req.sampling_params.mediator
-        frame = mediator.info.frame
-        
-        for key, value in frame.items():
-            if id(value) in Globals.saves:
-                result[key] = value
-    
-    # Cleanup
-    for req_id in finished_request_ids:
-        req.sampling_params.mediator.cancel()
-    
+            print(update.status, update.description)
     return result
 ```
 
----
+The connection closes automatically when the await resolves or the iterator
+finishes. Construct the backend and enter the trace on the same thread that later
+awaits it. (`docs/remote/remote-async.md`.)
 
-## 7. Debugging
+### 9.5 Sessions
 
-Debugging in NNsight presents unique challenges due to its **deferred execution** architecture. When an exception occurs inside a trace, it actually happens in a compiled function running in a worker thread — not in the original source code. Without special handling, stack traces would point to internal NNsight code, making debugging nearly impossible.
-
-NNsight solves this by **reconstructing exception tracebacks** to show the user's original code and line numbers, as if deferred execution never happened.
-
----
-
-### 7.1 The Challenge
-
-When you write:
-
-```python
-with model.trace("Hello"):
-    hidden = model.transformer.h[100].output.save()  # IndexError: layer 100 doesn't exist
-```
-
-What actually executes is:
+With `remote=True`, a session bundles several traces into a **single** NDIF job.
+The examples use `REMOTE = "local"`, so they validate serialization and execute
+in your local process; they do not submit a server job. The whole session
+block serializes as one request, queues once, executes contiguously on the
+server, and returns its saved values together — one queue wait instead of three
+for a three-step experiment. `remote=True` goes on `model.session(...)`, **not**
+on the inner `model.trace(...)` calls: the session already provides the remote
+backend, and the inner traces run inside it.
 
 ```python
-def __nnsight_intervention__(mediator, info, ...):
-    hidden = model.transformer.h[100].output.save()
+with model.session(remote=REMOTE):
+    with model.trace("Megan Rapinoe plays the sport of"):
+        hs = model.transformer.h[5].output[:, -1, :]
+    with model.trace("Shaquille O'Neal plays the sport of"):
+        model.transformer.h[5].output[:, -1, :] = hs
+        patched = model.lm_head.output[0, -1].argmax(-1).save()
 ```
 
-This compiled function runs in a worker thread. If Python's default exception handling ran, you'd see:
-
-```
-Traceback (most recent call last):
-  File "/path/to/nnsight/intervention/interleaver.py", line 654, in start
-    self.worker.start()
-  File "<nnsight_trace_abc123>", line 1, in __nnsight_intervention__
-    hidden = model.transformer.h[100].output.save()
-IndexError: list index out of range
-```
-
-The `<nnsight_trace_abc123>` filename is meaningless, and the line number `1` doesn't correspond to anything in the user's file.
-
----
-
-### 7.2 Exception Reconstruction
-
-NNsight intercepts exceptions and reconstructs their tracebacks to show the original source location.
-
-#### ExceptionWrapper
-
-The `ExceptionWrapper` class captures exception information and rebuilds the traceback string:
-
-```python
-class ExceptionWrapper(Exception):
-    def __init__(self, info: "Tracer.Info", original: Exception):
-        self.original = original
-        self.infos = []  # Accumulates Tracer.Info from nested traces
-        self.set_info(info)
-    
-    def __str__(self):
-        # Reconstruct traceback pointing to original source
-        ...
-```
-
-**Key insight:** `ExceptionWrapper` maintains a list of `Tracer.Info` objects — one for each layer of deferred execution (nested traces, invokes, sessions, backward passes).
-
-#### wrap_exception
-
-The `wrap_exception` function creates a dynamic exception type that:
-
-1. **Inherits from the original exception type** — so `isinstance(e, IndexError)` still works
-2. **Inherits from ExceptionWrapper** — to provide the reconstructed traceback
-
-```python
-def wrap_exception(exception: Exception, info: "Tracer.Info"):
-    if isinstance(exception, ExceptionWrapper):
-        # Already wrapped — just add this layer's info
-        exception.set_info(info)
-        return exception
-    
-    # Create dynamic type inheriting from both
-    exception_type = type(exception)
-    
-    class NNsightException(exception_type, ExceptionWrapper):
-        def __str__(self):
-            return ExceptionWrapper.__str__(self)
-    
-    wrapped = NNsightException(*exception.args)
-    return wrapped
-```
-
-This ensures:
-- Users can still catch exceptions by type (`except IndexError:`)
-- The exception displays a clean, reconstructed traceback
-
-#### Exception Suppression
-
-To make the traceback look like a normal Python exception, NNsight suppresses the exception chain:
-
-```python
-exception.__suppress_context__ = True  # Removes "During handling of..." message
-exception.__traceback__ = None         # Clears internal traceback
-```
-
-Without this, users would see confusing "During handling of the above exception, another exception occurred" messages from internal exception handling.
-
----
-
-### 7.3 Line Number Reconstruction
-
-Each `Tracer.Info` object contains:
-
-| Field | Description |
-|-------|-------------|
-| `source` | The extracted source code lines |
-| `start_line` | Line offset within the compiled function |
-| `frame` | The original Python frame where the trace was entered |
-
-**The Problem:** NNsight wraps user code in a function and may add setup code above it:
-
-```python
-# Compiled function (what actually runs)
-def __nnsight_intervention__(mediator, info):
-    # NNsight adds 2 setup lines here
-    __nnsight_setup_1__()
-    __nnsight_setup_2__()
-    # User's code starts here (offset = 3)
-    hidden = model.transformer.h[100].output.save()  # Line 4 in compiled
-```
-
-If an exception occurs on line 4 of the compiled code, NNsight must:
-1. Subtract the `start_line` offset (3) to get the relative position (1)
-2. Add the original function's starting line number
-3. Result: the exact line in the user's source file
-
-#### Synthetic Filenames
-
-Compiled intervention code uses synthetic filenames like `<nnsight_trace_abc123>`. When building the traceback:
-
-- **`<nnsight...>` frames** → Mapped back to original file and line number
-- **`nnsight/` internal frames** → Skipped by default (shown with DEBUG mode)
-- **Regular frames** → Shown normally
-
----
-
-### 7.4 Where Exceptions Are Caught
-
-Exceptions are caught at two key points:
-
-#### 1. ExecutionBackend
-
-When the trace exits and execution begins:
-
-```python
-class ExecutionBackend(Backend):
-    def __call__(self, tracer: Tracer):
-        fn = super().__call__(tracer)
-        
-        try:
-            Globals.enter()
-            return tracer.execute(fn)
-        except Exception as e:
-            raise wrap_exception(e, tracer.info) from None
-        finally:
-            Globals.exit()
-```
-
-This catches exceptions from the top-level trace.
-
-#### 2. Mediator Exception Handling
-
-When a worker thread encounters an exception:
-
-```python
-# In Mediator
-def exception(self, exception: Exception):
-    self.event_queue.put((Events.EXCEPTION, exception))
-
-# In Mediator.handle_exception_event
-def handle_exception_event(self, exception: Exception):
-    self.cancel()
-    
-    if not isinstance(exception, Cancelation):
-        exception = wrap_exception(exception, self.info)
-        raise exception
-```
-
-Each layer of deferred execution (invoke, backward trace, etc.) wraps the exception with its own `Tracer.Info`, building up the full traceback.
-
----
-
-### 7.5 DEBUG Mode
-
-By default, NNsight hides its internal frames from tracebacks:
-
-```python
-elif "nnsight/" in filename:
-    if CONFIG.APP.DEBUG:
-        # Show nnsight internal lines
-        tb_frames.append(f'  File "{filename}", line {lineno}, in {name}')
-```
-
-**Default (DEBUG=False):** Only shows user code and external libraries. This is cleaner and usually sufficient for debugging interventions.
-
-**With DEBUG=True:** Shows the full execution path through NNsight internals. Useful for:
-- NNsight developers debugging the library
-- Advanced users when the default traceback isn't helpful
-- Understanding exactly where in the execution pipeline an error occurred
-
-#### Enabling DEBUG Mode
-
-```python
-from nnsight import CONFIG
-
-CONFIG.APP.DEBUG = True
-CONFIG.save()  # Persist across sessions
-```
-
----
-
-### 7.6 What Users See
-
-With all this machinery, users see clean, familiar tracebacks:
-
-```python
-# User's file: my_experiment.py
-1  from nnsight import LanguageModel
-2  
-3  model = LanguageModel("gpt2")
-4  
-5  with model.trace("Hello"):
-6      hidden = model.transformer.h[100].output.save()  # Bug: only 12 layers!
-```
-
-**Exception output:**
-
-```
-Traceback (most recent call last):
-  File "my_experiment.py", line 6, in <module>
-    hidden = model.transformer.h[100].output.save()
-IndexError: list index out of range
-```
-
-This looks exactly like a normal Python exception — pointing to line 6 of the original file, with the actual code shown. The deferred execution is invisible.
-
----
-
-### 7.7 Common Exceptions
-
-#### OutOfOrderError
-
-Raised when you access modules in the wrong order within a single invoke.
-
-```python
-with model.trace("Hello"):
-    out2 = model.transformer.h[5].output.save()  # Wait for layer 5
-    out1 = model.transformer.h[2].output.save()  # Layer 2 already passed!
-```
-
-**Message:**
-```
-OutOfOrderError: Value was missed for model.transformer.h.2.output.i0. Did you call an Envoy out of order?
-```
-
-**What the `.i0` means:** The suffix `.i0` indicates iteration 0 (the first call to this module). In multi-token generation, you'd see `.i1`, `.i2`, etc.
-
-**Fix:** Access modules in forward-pass order, or use separate invokes.
-
----
-
-#### Dangling Mediator Error
-
-Raised when execution completes but a mediator is still waiting for a value. This happens when:
-1. A module you accessed was never actually called
-2. You accessed gradients in the wrong order (backward order is reverse of forward)
-
-```python
-with model.trace("Hello"):
-    out1 = model.layer1.output
-    out2 = model.layer2.output
-    loss = model.output.sum()
-    
-    with loss.backward():
-        # Wrong order! Gradients flow backwards: layer2 → layer1
-        grad1 = out1.grad.save()  # Waits...
-        grad2 = out2.grad.save()  # layer2 grad already passed!
-```
-
-**Message:**
-```
-ValueError: Execution complete but `139820463417744.grad` was not provided. 
-Did you call an Envoy out of order? Investigate why this module was not called.
-```
-
-**Note:** For gradients, the number (e.g., `139820463417744`) is the tensor's `id()`, not a module path.
-
-**Fix:** Access gradients in reverse order of the forward pass.
-
----
-
-#### ValueError: Cannot return output of Envoy that is not interleaving
-
-Raised when you try to access `.output` but the model never ran.
-
-```python
-with model.trace():  # No input!
-    out = model.layer1.output.save()  # Error!
-```
-
-**Message:**
-```
-ValueError: Cannot return output of Envoy that is not interleaving nor has a fake output set.
-```
-
-**Common causes:**
-1. `.trace()` called with no input and no invokes
-2. `.trace()` called with only keyword arguments (base `NNsight` requires positional args)
-
-**Fix:** Provide input to `.trace(input)` or use `.invoke()`:
-
-```python
-# Either provide input directly:
-with model.trace(input_tensor):
-    out = model.layer1.output.save()
-
-# Or use invokes:
-with model.trace() as tracer:
-    with tracer.invoke(input_tensor):
-        out = model.layer1.output.save()
-```
-
----
-
-#### AttributeError for Nonexistent Module
-
-Raised when you access a module that doesn't exist. NNsight helpfully shows the model structure:
-
-```python
-with model.trace("Hello"):
-    out = model.fake_layer.output.save()  # Doesn't exist!
-```
-
-**Message:**
-```
-AttributeError: Sequential(
-  (layer1): Linear(in_features=5, out_features=10, bias=True)
-  (layer2): Linear(in_features=10, out_features=2, bias=True)
-) has no attribute fake_layer
-```
-
-**Fix:** Use `print(model)` to see the correct module names.
-
----
-
-#### WithBlockNotFoundError
-
-Raised when NNsight's AST parser cannot find the `with` block at the expected line. This is rare in normal usage.
-
-**Message includes context:**
-```
-WithBlockNotFoundError: With block not found at line 42
-We looked here:
-
-    some_code()
-    with model.trace("Hello"):  <--- HERE
-        ...
-```
-
-**Common causes:**
-1. Unusual source code layouts
-2. Dynamic code generation
-3. Issues with line number mapping in complex execution environments
-
----
-
-#### ValueError: Cannot invoke during active interleaving
-
-Raised when you try to create an invoke inside another invoke.
-
-```python
-with model.trace() as tracer:
-    with tracer.invoke("Hello"):
-        # WRONG: Trying to nest invokes
-        with tracer.invoke("World"):  # Error!
-            out = model.layer.output.save()
-```
-
-**Message:**
-```
-ValueError: Cannot invoke during an active model execution / interleaving.
-```
-
-**Why:** Each invoke is a separate worker thread that runs during the model's forward pass. You cannot start a new forward pass (invoke) while one is already running.
-
-**Fix:** Use separate, sequential invokes:
-
-```python
-with model.trace() as tracer:
-    with tracer.invoke("Hello"):
-        out1 = model.layer.output.save()
-    
-    with tracer.invoke("World"):  # OK: after previous invoke finished
-        out2 = model.layer.output.save()
-```
-
----
-
-#### ValueError in Backward Tracer
-
-Raised when you try to access `.output` or `.input` inside a `backward()` context instead of `.grad`.
-
-```python
-with model.trace("Hello"):
-    out = model.layer1.output
-    loss = model.output.sum()
-    
-    with loss.backward():
-        # WRONG: Accessing .output inside backward
-        another_out = model.layer2.output  # Error!
-```
-
-**Message:**
-```
-ValueError: Cannot request `model.layer2.output.i0` in a backwards tracer. 
-You can only request `.grad`. Please define your Tensors before the Backwards 
-Tracer and interact with their gradients within the Backwards Tracer.
-```
-
-**Fix:** Define tensors outside backward, access `.grad` inside:
-
-```python
-with model.trace("Hello"):
-    out1 = model.layer1.output  # Get tensors BEFORE backward
-    out2 = model.layer2.output
-    loss = model.output.sum()
-    
-    with loss.backward():
-        grad1 = out1.grad.save()  # Access .grad INSIDE backward
-        grad2 = out2.grad.save()
-```
-
----
-
-### 7.8 Debugging Strategies
-
-#### 1. Print Model Structure
-
-Before writing interventions, understand what modules are available:
-
-```python
-print(model)  # Shows full module hierarchy
-print(model.transformer.h[0])  # Shows specific submodule
-```
-
-#### 2. Use Print Statements
-
-Print works normally inside traces:
-
-```python
-with model.trace("Hello"):
-    out = model.transformer.h[0].output
-    print("Layer 0 shape:", out.shape)
-    print("Layer 0 mean:", out.mean())
-```
-
-#### 3. Use Breakpoints
-
-Python's `breakpoint()` works inside traces for interactive debugging:
-
-```python
-with model.trace("Hello"):
-    out = model.transformer.h[0].output
-    breakpoint()  # Drops into pdb - inspect `out`, `out.shape`, etc.
-    modified = out * 2
-```
-
-#### 4. Use `.scan()` to Check Shapes
-
-Run with fake tensors to verify shapes without full computation:
-
-```python
-with model.scan("Hello"):
-    print(model.transformer.h[0].output[0].shape)  # [1, seq_len, hidden_dim]
-```
-
-#### 5. Enable DEBUG Mode
-
-When the default traceback isn't helpful:
-
-```python
-from nnsight import CONFIG
-CONFIG.APP.DEBUG = True
-```
-
-This shows internal NNsight frames, which can help understand the execution path.
-
-#### 6. Simplify and Isolate
-
-If a complex trace fails, simplify:
-
-```python
-# Start simple
-with model.trace("Hello"):
-    out = model.transformer.h[0].output.save()
-
-# Gradually add complexity
-with model.trace("Hello"):
-    out = model.transformer.h[0].output.save()
-    # Add next operation here
-```
-
-#### 7. Check Module Execution Order
-
-If you're unsure of the execution order, access modules one at a time:
-
-```python
-with model.trace("Hello"):
-    out0 = model.transformer.h[0].output.save()
-    print("Got layer 0")
-    
-with model.trace("Hello"):
-    out5 = model.transformer.h[5].output.save()
-    print("Got layer 5")
-```
-
----
-
-## 8. Remote Execution
-
-NNsight enables remote execution of interventions on large models hosted by NDIF (National Deep Inference Fabric). This allows you to run experiments on models with hundreds of billions of parameters without needing local GPU resources.
-
----
-
-### 8.1 NDIF Overview
-
-NDIF is the complementary service to NNsight that hosts large models for shared access. Through NDIF, users can perform interventions on models up to 400+ billion parameters without local model loading or GPU requirements.
-
-#### Checking Service Status
+The reason to reach for a session over a run of separate remote traces is that
+**values flow across traces without a round trip**. `hs` above is captured in the
+first trace and reused in the second; on NDIF it stays on the server, so no `.save()`
+and no result download. You call `.save()` only on the values you want returned
+to your process — cross-trace sharing inside the session is free, cross-process
+(server → you) is not. To carry a collection built across traces back, create it
+as a saved accumulator at session scope and append to it:
 
 ```python
 import nnsight
 
-# View all available models
-nnsight.ndif_status()
+with model.session(remote=REMOTE):
+    means = nnsight.save([])                      # saved accumulator
+    for i in range(12):
+        with model.trace("Hello"):
+            means.append(model.transformer.h[i].output.mean())
 
-# Check if a specific model is running
-nnsight.is_model_running("meta-llama/Llama-3.1-8B")  # Returns True/False
+print(len(means))   # 12
 ```
 
-The status shows model availability:
+Sessions cut queue and transport overhead, not GPU time; a five-minute session is
+still five minutes of compute. Outside references must be serializable for an
+NDIF job; create and save result accumulators inside the session. And a session
+is all-or-nothing: if any inner trace raises, the job aborts and no further
+traces run, so structure fault-tolerant pipelines as separate jobs. Sessions
+support `blocking=False` too, polled through `session.backend()` exactly like a
+non-blocking trace. This all rests on the same `Remotable` mixin that powers
+`trace(remote=True)` — see [The mixin architecture](#71-the-mixin-architecture)
+and the local [Sessions](#611-sessions). (`docs/remote/remote-session.md`.)
 
-| Type | Description |
-|------|-------------|
-| **Dedicated** | Permanently served models |
-| **Scheduled** | Rotating models following a deployment schedule |
-| **Pilot-Only** | Reserved for Hot-Swapping program participants |
+### 9.6 remote="local"
 
-Visit [nnsight.net/status](https://nnsight.net/status/) for the current status, or [the NDIF calendar](https://calendar.google.com/calendar/u/0/embed?src=a7cbc58fdb0ddd93a260cd35f34492e8a38c360c44b72c8539e43aa99aeca436@group.calendar.google.com) for scheduled deployments.
-
----
-
-### 8.2 Setup
-
-#### API Key
-
-To access NDIF, you need an API key from [login.ndif.us](https://login.ndif.us):
-
-```python
-from nnsight import CONFIG
-
-CONFIG.set_default_api_key("<your api key>")
-```
-
-This saves the key for all future use.
-
-#### Compatibility Requirements
-
-| Requirement | Value |
-|-------------|-------|
-| Python | `3.12.*` |
-| NNsight | `>= 0.5.13` |
-| HuggingFace Token | Required (set `HF_TOKEN` environment variable) |
-
----
-
-### 8.3 Basic Remote Execution
-
-Remote execution is as simple as adding `remote=True` to your trace:
+`remote="local"` runs the entire serialize → deserialize → execute round trip
+**in-process** — no server, no network, no key. It is a dry run of a real NDIF
+request: `LocalSimulationBackend`
+(`src/nnsight/intervention/backends/local.py`) serializes the trace exactly as
+`RemoteBackend` would, then deserializes it *with your non-installed modules
+hidden* — mimicking a server whose environment does not contain your own source
+files. It then executes the restored code through the original tracer against
+your real, dispatched local model and the original local scope. Results land
+back in your frame like an ordinary local trace. This checks serialization,
+but does not reproduce server process isolation: external mutable objects can
+still be changed locally.
 
 ```python
-from nnsight import LanguageModel
+from nnsight import TransformersModel
 
-# Model loads as meta tensors (no GPU memory)
-model = LanguageModel("meta-llama/Llama-3.1-8B")
-print(model.device)  # "meta"
+model = TransformersModel("openai-community/gpt2", task="text-generation", dispatch=True, attn_implementation="eager")
 
-# Execute remotely
-with model.trace("The Eiffel Tower is in the city of", remote=True):
+with model.trace("The Eiffel Tower is in the city of", remote="local"):
     logit = model.lm_head.output[0][-1].argmax(dim=-1).save()
 
-print(model.tokenizer.decode(logit))  # "Paris"
+print(model.tokenizer.decode(logit))   # ' Paris'
 ```
 
-#### How It Works
-
-1. **Meta Loading**: `LanguageModel("...")` creates a skeleton model on the `meta` device — no weights are loaded locally
-2. **Code Capture**: Your intervention code is captured and serialized
-3. **Remote Execution**: The serialized intervention is sent to NDIF and executed on the hosted model
-4. **Result Download**: Saved values are downloaded back to your local environment
-
-#### Request Lifecycle
-
-The logs show your request's progress:
-
-| Status | Description |
-|--------|-------------|
-| `RECEIVED` | Request validated with authorized API key |
-| `QUEUED` | Waiting in model's queue (FIFO) |
-| `DISPATCHED` | Forwarded to model deployment |
-| `RUNNING` | Interleaving with model execution |
-| `COMPLETED` | Results available for download |
-
-Disable logging with:
-
-```python
-from nnsight import CONFIG
-CONFIG.APP.REMOTE_LOGGING = False
-```
+The point is the hidden-modules step. If your block references a local function
+or class that was not shipped by value, the deserialize raises
+`ModuleNotFoundError` — exactly as it would on the server — so a passing
+`remote="local"` run checks that the payload can be reconstructed without those
+modules. It does not check server model availability, credentials, dependencies,
+or process isolation; live validation still requires a compatible NDIF service.
+(`docs/remote/ndif-overview.md`,
+`docs/remote/register-local-modules.md`.)
 
 ---
 
-### 8.4 Remote Model Parameters
+## 10. Extending nnsight
 
-#### Revision
+Everything nnsight does to a model — mirroring its tree, hooking its values,
+batching several prompts into one forward, loading it lazily, shipping it to
+NDIF — is assembled from a handful of small, overridable pieces. You extend
+nnsight by subclassing one of those pieces and filling in a method or two, not
+by reaching into the interleaver. The extension surface is deliberately narrow:
+underscore-prefixed methods with working defaults, a descriptor for hookable
+values, a class attribute for the batch layout, and a one-method `Backend`.
+This section walks each in turn.
 
-Access specific model revisions:
+The mental model to carry in: `NNsight` *is* an `Envoy` (see [The Envoy](#5-the-envoy)),
+the higher-level model classes are envoys with a loading/execution mixin chain
+stacked on top (see [The mixin architecture](#71-the-mixin-architecture)), and
+every value you can read or write is an `eproperty` over one location string
+(see [eproperties: how values are hooked](#52-eproperties-how-values-are-hooked)).
+Extending nnsight means adding to one of those three layers. The recipe-style
+reference for all of this is `docs/usage/extending.md`; the developer deep-dives
+are `docs/developing/extending-envoy.md`, `docs/developing/adding-a-new-runtime.md`,
+and `docs/developing/adding-a-new-backend.md`.
 
-```python
-model = LanguageModel("meta-llama/Llama-3.1-8B", revision="main")
-```
+### 10.1 Subclassing NNsight and Envoy
 
-#### Renaming
-
-Module aliasing works the same as local execution:
-
-```python
-model = LanguageModel("meta-llama/Llama-3.1-8B", rename={"lm_head": "unembed"})
-
-with model.trace("Hello", remote=True):
-    logit = model.unembed.output[0][-1].argmax(dim=-1).save()
-```
-
----
-
-### 8.5 Saving Results
-
-#### The Remote `.save()` Difference
-
-In local execution, `.save()` marks values to persist after the trace. In remote execution, `.save()` is **essential** — it's how values are transmitted back to your local environment.
-
-**⚠️ Critical Gotcha: Mutating Local Objects**
-
-```python
-# WRONG: Local list won't be updated
-logits_l = list()
-with model.generate("Hello", max_new_tokens=5, remote=True) as tracer:
-    with tracer.all():
-        logits_l.append(model.lm_head.output[0].save())
-    print(f"List length is {len(logits_l)}")  # Shows 5 on server
-
-assert len(logits_l) == 5  # FAILS! Local list is still empty
-```
-
-The list is populated on the server, but the local `logits_l` is never updated.
-
-**Solution: Create and save objects inside the trace:**
+The simplest extension adds behavior to a whole model. `NNsight` is a thin,
+named `Envoy` (`class NNsight(Envoy)` with an empty body in
+`src/nnsight/modeling/base.py`), so a subclass of it is a normal Python class
+that also happens to wrap a module tree. Add methods that run inside a trace,
+add per-instance configuration in `__init__`, override `_batch_size`/`_batch`
+to support batched invokes (see [Batching](#72-batching)) — nothing about the
+subclass is special until you override a hook.
 
 ```python
-# CORRECT: Create list inside trace and save it
-with model.generate("Hello", max_new_tokens=5, remote=True) as tracer:
-    logits_l = list().save()  # Create inside trace
-    with tracer.all():
-        logits_l.append(model.lm_head.output[0].save())
+from nnsight import NNsight
 
-assert len(logits_l) == 5  # Works!
+class MyModel(NNsight):
+    def logit_lens(self, hidden):
+        return self[1](hidden)      # run a later module ad hoc, inside the trace
 ```
 
-#### Saving Tensors Efficiently
+Calling a child envoy directly (`self[1](hidden)`) runs that module's forward
+out of execution order without re-entering the controller's handoff — the logit-lens
+idiom, and the reason `Envoy.__call__` exists. Because a class-level attribute on
+an `Envoy`/`NNsight` subclass is shared across every instance, keep mutable
+per-model config (a head count, a device map) in `__init__`, not at class scope.
 
-Move tensors to CPU before saving for minimal download size:
+**When you need loading, lazy build, or remote, subclass the mixin chain instead
+of `NNsight`.** `NNsight` wraps an already-instantiated `nn.Module`; it has no
+`_load`, no `dispatch`, no `scan`. Those capabilities live in a short chain of
+mixins over `Envoy`, and you inherit exactly as many as you need
+(`src/nnsight/modeling/mixins/`, and see [The mixin architecture](#71-the-mixin-architecture)):
+
+```
+Envoy               the tree; controllers; trace / interleave / __call__
+ └─ Loadable        _load(...): construct the module from a spec, not a passed one
+     └─ Meta        meta-device build up front; dispatch() swaps in real weights; scan()
+         └─ Remotable   remote model key + per-request env; remote & local backends
+             └─ HuggingFaceModel   from_pretrained loading by repo id
+```
+
+Pick the lowest base that gives you what you need. If you already hold the
+`nn.Module`, `NNsight(module)` is enough. If you construct it from a repo id or
+a config, start at `Loadable` and override `_load`:
 
 ```python
-with model.trace("Hello", remote=True):
-    # Best practice: detach and move to CPU
-    logit = model.lm_head.output.detach().cpu().save()
-```
-
----
-
-### 8.6 Sessions for Remote Execution
-
-When your experiment requires multiple forward passes with shared state, use sessions to bundle them into a single remote request.
-
-#### The Problem: Multiple Remote Calls
-
-```python
-# Inefficient: 3 separate remote requests with queue waits
-with model.trace("Megan Rapinoe plays the sport of", remote=True):
-    hs = model.model.layers[5].output[:, 5, :].save()
-
-with model.trace("Shaquille O'Neal plays the sport of", remote=True):
-    out_clean = model.lm_head.output[0][-1].argmax(dim=-1).save()
-
-with model.trace("Shaquille O'Neal plays the sport of", remote=True):
-    model.model.layers[5].output[:, 6, :] = hs  # Uses downloaded hs
-    out_patched = model.lm_head.output[0][-1].argmax(dim=-1).save()
-```
-
-Each trace is a separate request, requiring separate queue waits and downloads.
-
-#### The Solution: Sessions
-
-```python
-# Efficient: Single remote request
-with model.session(remote=True):
-    with model.trace("Megan Rapinoe plays the sport of"):
-        hs = model.model.layers[5].output[:, 5, :]  # No .save() needed!
-
-    with model.trace() as tracer:
-        with tracer.invoke("Shaquille O'Neal plays the sport of"):
-            out_clean = model.lm_head.output[0][-1].argmax(dim=-1).save()
-
-        with tracer.invoke("Shaquille O'Neal plays the sport of"):
-            model.model.layers[5].output[:, 6, :] = hs  # Direct reference
-            out_patched = model.lm_head.output[0][-1].argmax(dim=-1).save()
-
-print("Clean:", model.tokenizer.decode(out_clean))
-print("Patched:", model.tokenizer.decode(out_patched))
-```
-
-**Benefits of sessions:**
-
-1. **Single request** — No queue waits between traces
-2. **Shared state** — Values from earlier traces can be referenced directly (no `.save()` needed)
-3. **Arbitrary code** — You can add processing code between traces
-4. **Only `remote=True` on session** — Inner traces automatically run remotely
-
----
-
-### 8.7 Gradients Remotely
-
-Gradients are disabled on NDIF by default. Enable them by setting `requires_grad = True`:
-
-```python
-with model.trace("The Eiffel Tower is in the city of", remote=True):
-    hs_3 = model.model.layers[3].output
-    hs_3.requires_grad = True  # Enable gradients from this point
-
-    hs_5 = model.model.layers[5].output
-    logits = model.output.logits
-
-    with logits.sum().backward():
-        # Access gradients in reverse order
-        logits_grad = logits.grad.save()
-        hs_5_grad = hs_5.grad.save()
-        hs_3_grad = hs_3.grad.save()
-```
-
-**Note:** Set `requires_grad = True` at the earliest point where you need gradients.
-
----
-
-### 8.8 Python Module Whitelist
-
-For security, NDIF maintains a whitelist of approved Python modules that can be used in intervention code:
-
-| Module | Description |
-|--------|-------------|
-| `builtins` | Python built-in functions |
-| `torch` | PyTorch operations |
-| `collections` | Data structures |
-| `time` | Time utilities |
-| `numpy` | Numerical computing |
-| `sympy` | Symbolic math |
-| `nnterp` | Interpretability utilities |
-| `math` | Math functions |
-| `einops` | Tensor operations |
-| `typing` | Type hints |
-
-#### Referencing Local Modules
-
-If your experiment spans multiple files, register them for serialization:
-
-```python
-import cloudpickle
-
-cloudpickle.register_pickle_by_value("<your_module>")
-```
-
-This allows your custom modules to be pickled and sent with the intervention code.
-
----
-
-### 8.9 Limitations
-
-NDIF is a shared research infrastructure with usage limits:
-
-| Limit | Value |
-|-------|-------|
-| Maximum job run time | 1 hour |
-
-Jobs exceeding these limits are automatically denied or aborted.
-
-**Other considerations:**
-
-- NDIF runs on the [NCSA Delta](https://delta.ncsa.illinois.edu) cluster — services may be down during cluster maintenance
-- High usage periods may cause queue delays
-- For special research cases, contact [info@ndif.us](mailto:info@ndif.us)
-
-**Known remote-specific issues:**
-
-- **`tracer.result` in generation**: For remote generation with `.generate()`, use `model.generator.output.save()` instead of `tracer.result.save()`:
-  
-  ```python
-  # For remote generation:
-  with model.generate("Hello", max_new_tokens=5, remote=True) as tracer:
-      # Use model.generator.output instead of tracer.result
-      output = model.generator.output.save()
-  ```
-
----
-
-### 8.10 Hybrid Execution with `tracer.local()`
-
-Sometimes you need to combine remote model execution with local computation — for example, using a local tensor that can't be serialized, or streaming intermediate results.
-
-The `tracer.local()` context runs a portion of your intervention code **back on your local machine**:
-
-```python
-import torch
-
-local_bias = torch.randn(4096)  # Local tensor
-
-with model.trace("Hello", remote=True) as tracer:
-    # This runs on NDIF
-    hidden = model.model.layers[5].output[0]
-    
-    # This runs locally on your machine
-    with tracer.local():
-        # Can use local tensors here
-        modified = hidden + local_bias
-        
-        # Can also stream results as they're ready
-        print("Got hidden states:", hidden.shape)
-    
-    # Back to remote execution
-    model.model.layers[5].output[0] = modified
-    output = model.lm_head.output.save()
-```
-
-**Use cases:**
-
-- **Local tensors**: Use data that can't be serialized to the server
-- **Streaming results**: Access intermediate values before the trace completes
-- **Complex local processing**: Run computations that aren't in the whitelist
-
-**How it works:**
-
-1. When `tracer.local()` is entered, the server serializes the current intervention state
-2. The state is sent back to the client via WebSocket
-3. The local code executes with access to the intervention variables
-4. Modified values are sent back to the server
-5. Remote execution continues
-
----
-
-### 8.11 Print Statements and Logging
-
-Print statements inside remote traces are captured and sent back to your client:
-
-```python
-with model.trace("Hello", remote=True):
-    hidden = model.model.layers[5].output[0]
-    print(f"Hidden shape: {hidden.shape}")  # Appears as LOG status
-    print(f"Hidden mean: {hidden.mean()}")
-```
-
-The output appears in your logs with `LOG` status:
-
-```
-[job-id] LOG        : Hidden shape: torch.Size([1, 10, 4096])
-[job-id] LOG        : Hidden mean: 0.0023
-```
-
-This is useful for debugging remote interventions without saving every intermediate value.
-
----
-
-### 8.12 Implementation Details
-
-#### Communication Flow
-
-The `RemoteBackend` handles all communication between your client and NDIF:
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Client                                                                  │
-│                                                                          │
-│  1. Serialize Tracer (with compiled intervention)                       │
-│  2. POST to /request with headers (model-key, api-key, version, etc.)   │
-│  3. Connect WebSocket for real-time updates                             │
-│                                                                          │
-└────────────────────────────────┬────────────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  NDIF Server                                                             │
-│                                                                          │
-│  1. Validate request (API key, Python version, nnsight version)         │
-│  2. Queue request for target model                                       │
-│  3. Send status updates via WebSocket (QUEUED, RUNNING, etc.)           │
-│  4. Execute intervention against hosted model                            │
-│  5. Serialize saved values and send COMPLETED                            │
-│                                                                          │
-└────────────────────────────────┬────────────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Client                                                                  │
-│                                                                          │
-│  1. Receive COMPLETED status via WebSocket                               │
-│  2. Download result (streaming with progress bar)                       │
-│  3. Deserialize and populate saved variables                            │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-#### Blocking vs Non-Blocking Execution
-
-By default, `remote=True` uses **blocking** execution — your code waits for the result:
-
-```python
-# Blocking (default) - waits for completion
-with model.trace("Hello", remote=True):
+from nnsight.modeling.mixins.loadable import Loadable
+
+class MyLoadable(Loadable):
+    def _load(self, shape, **kwargs):
+        in_features, out_features = map(int, shape.split(":"))
+        return torch.nn.Linear(in_features, out_features, **kwargs)
+
+model = MyLoadable("5:2")
+with model.trace(torch.ones(1, 5)):
     output = model.output.save()
-
-print(output)  # Available immediately after trace exits
 ```
 
-For **non-blocking** execution, set `blocking=False`:
+`Loadable.__init__` routes every construction through `_load`
+(`src/nnsight/modeling/mixins/loadable.py`). The base `_load` returns a ready
+`torch.nn.Module` as-is — so `Loadable(mod)` still wraps a live module directly —
+and raises `NotImplementedError` for anything else. Your override decides what a
+pre-loaded module means for your runtime (`TransformersModel`, for instance,
+wraps a passed module in a `transformers.pipeline`). `rename` and `envoys` are
+`Envoy` concerns, not load arguments, so the mixin keeps them out of the `_load`
+signature.
+
+If you also want a **meta-device tree built up front** — so users can build the
+envoy tree, inspect shapes, and call `scan()` without paying for weights — add
+the `Meta` mixin and override `_load_meta` alongside `_load`. `Meta.__init__`
+runs `_load_meta` inside `with MetaDevice():`, which forces every tensor onto the
+meta device; `dispatch()` later calls `_load` and re-points the tree at real
+weights, and it fires automatically on the first `interleave` if not already
+dispatched. `DiffusionModel` is the worked example
+(`src/nnsight/modeling/diffusion.py`): `_load` builds a real pipeline with real
+weights, and `_load_meta` assembles a same-shape pipeline component-by-component
+from configs on the meta device, loading only the light components (schedulers,
+tokenizers) for real. Override `_load`, not `dispatch`, when loading needs
+preconditions.
+
+**Attaching a standalone module to the tree.** Submodules of the wrapped module
+are mirrored as envoys automatically. To expose a module that is *not* part of
+the wrapped module — a streamer, a sampler, a generated-id passthrough — build an
+`Envoy` over it with the model's own interleaver and append it to `_children`.
+This is exactly how `TransformersModel` exposes `model.generator`
+(`src/nnsight/modeling/transformers.py`):
+
+> **Implementation excerpt:** illustrates internal contracts; it is not a standalone recipe. The example checks compile it and exercise the corresponding installed implementation.
 
 ```python
-# Non-blocking - returns immediately
-with model.trace("Hello", remote=True, blocking=False) as tracer:
-    output = model.lm_head.output.save()
+from nnsight.modeling.transformers import Generator
 
-# Trace exits immediately, job is queued on server
-backend = tracer.backend  # Get the RemoteBackend
-print(backend.job_id)      # UUID of the job
-print(backend.job_status)  # JobStatus.RECEIVED initially
-
-# Poll for result
-import time
-while True:
-    result = backend()  # Returns None if not complete
-    if result is not None:
-        break
-    print(f"Status: {backend.job_status}")  # QUEUED, RUNNING, etc.
-    time.sleep(1)
-
-# Result is a dict with saved variable names as keys
-print(result.keys())        # dict_keys(['id', 'output'])
-print(result['output'].shape)  # The saved tensor
-```
-
-**Result structure:** When the job completes, `backend()` returns a dict where:
-- Keys are the variable names you used with `.save()`
-- Values are the saved tensors/objects
-- An `'id'` key contains the job ID
-
-Non-blocking is useful for:
-- Submitting multiple jobs in parallel
-- Long-running experiments where you want to check back later
-- Building async workflows
-
-#### Model Key Format
-
-NDIF identifies models using a **model key** string:
-
-```
-import.path.ClassName:json_payload
-```
-
-For example, a `LanguageModel`:
-
-```
-nnsight.modeling.language.LanguageModel:{"repo_id":"meta-llama/Llama-3.1-8B","revision":"main"}
-```
-
-The key contains:
-1. **Import path**: The Python class to instantiate on the server
-2. **JSON payload**: Initialization parameters (repo_id, revision, etc.)
-
-This allows the server to reconstruct the exact same model configuration.
-
-#### Request Serialization
-
-When you create a remote trace:
-
-1. **Tracer captured**: Your intervention code is compiled into a function
-2. **RequestModel created**: Contains the compiled intervention and tracer metadata
-3. **Serialization**: Uses `cloudpickle` to serialize, optionally compressed with zlib
-4. **Headers added**: Model key, API key, nnsight version, Python version, timestamp
-
-```python
-# Simplified view of what happens internally
-request = RequestModel(
-    interventions=compiled_intervention_fn,
-    tracer=tracer
+self.generator = Envoy(
+    Generator(), path=f"{self.path}.generator", interleaver=self.interleaver
 )
-data = request.serialize(zlib=True)
-
-headers = {
-    "nnsight-model-key": "...:...",
-    "nnsight-version": "0.5.x",
-    "python-version": "3.12.x",
-    "ndif-api-key": "your-api-key",
-}
+self._children.append(self.generator)
 ```
 
-#### Session Bundling
+Two constraints fall out. First, for the standalone module's `.output` to be
+*readable*, the module has to actually be called during the run — you pass values
+through it in your `trace`/`generate` override with `self.generator(output, hook=True)`,
+which fires its hooks so `model.generator.output` receives the value (and can
+edit it). Second, standalone children survive a model-environment rebind — lazy
+dispatch swapping in real weights, or a PEFT adapter rebind — because they keep
+their own module and controller rather than being rebuilt from the wrapped tree.
 
-A `session` context bundles multiple traces into a single request:
+### 10.2 Custom hookable values (eproperty)
+
+`.output`, `.input`, `.inputs`, and `tracer.result` are not special-cased in the
+interleaver — they are all instances of one descriptor, `eproperty`
+(`src/nnsight/intervention/eproperty.py`), and you can define your own. An
+`eproperty` turns a plain attribute into a hook into the run: reading it parks
+the worker until the model reaches that location and hands back the value there;
+writing it swaps a new value in. The location is `"{obj.path}.{key}"` — or just
+`key` when the host has no `path`, as for `tracer.result`. Because the descriptor
+reads and writes through the `Mediator`, an `eproperty` accessed outside a trace
+raises rather than returning stale state (see [eproperties: how values are
+hooked](#52-eproperties-how-values-are-hooked) and
+[Interleaving](#4-interleaving)).
+
+You define an `eproperty` for a value the model produces *outside* an ordinary
+module hook — an engine's logits, a per-head reshaping of an activation, a
+telemetry read — that you still want to read and edit like any other location.
+The whole mechanism is one primitive on the interleaver:
+`handle(location, value)` offers a produced value to every worker parked on that
+location and returns whatever they wrote back. An `eproperty` is the reusable
+read/write wrapper over one such location, with two ends.
+
+**The read side — the API a user writes.** Decorate a stub with `@eproperty`
+(bare) or `@eproperty(key=..., description=...)`. **The decorated stub *is* the
+preprocess**: it takes the raw value the interleaver served and returns what the
+user reads, so an identity view is just `return value`.
 
 ```python
-with model.session(remote=True):
-    # All traces in this block become one remote request
-    with model.trace("Hello"):
-        hs = model.model.layers[5].output  # No .save() needed
-    
-    with model.trace("World"):
-        model.model.layers[5].output = hs  # Can reference directly
-        output = model.lm_head.output.save()
+from nnsight.intervention.eproperty import eproperty
+
+class MyModel(NNsight):
+    @eproperty                       # key defaults to the stub's name, "telemetry"
+    def telemetry(self, value):      # preprocess: served value -> what you read
+        return value
 ```
 
-Benefits:
-1. **Single queue wait**: All traces execute without re-queuing
-2. **Shared state**: Values from earlier traces accessible in later ones
-3. **Reduced overhead**: One request/response cycle instead of many
+Three keyword and callback refinements shape the descriptor:
 
-The entire session is serialized as one intervention, executed sequentially on the server, and results are returned together
+- **`key`** — the location suffix appended to the host's path. It defaults to the
+  stub's name. Several eproperties may share a key to give different *views* of the
+  same location: `.inputs` uses `@eproperty(key="input")` so it and `.input`
+  address the same served value.
+- **`description=`** — a short label, used only in the repr. An `eproperty` with a
+  description surfaces in the Envoy repr tree as `(name): description`; the plain
+  built-in views (`.output`/`.input`) carry none and stay hidden. Give a runtime
+  value like `.logits` a description so it shows up.
+- **`.postprocess(self, value)`** — runs on a *written* value before it is swapped
+  in. `Envoy.input` uses it to repack a lone first argument back into the full
+  `(args, kwargs)` the model expects.
+- **`.transform(self, value)`** — the write-back half of a *reshaping* preprocess.
+  When the preprocess produces a copy, the user's in-place edits to that copy
+  are invisible to the model, which still holds the original.
+  A transform maps the edited view back to the model's layout; it fires once,
+  after the block is done with the read, and its result is spliced in as if
+  swapped. Note the asymmetry: an *aliasing* view (a `.view()` / `.transpose()`
+  that shares storage) propagates edits without a transform, so you only need one
+  when edits must be mapped back from a non-aliasing value.
 
----
+**The produce side — where the value exists.** `eproperty.provide(obj, value)`
+calls `obj.interleaver.handle(location, value)`, serving the value to a parked
+worker and returning it — edited if the worker wrote back. Call it from your
+runtime wherever the value is computed, inside an open interleaver context. This
+is how vLLM feeds `.logits` and `.samples` from its model runner:
+`type(model).logits.provide(model, original)` serves the value at
+`"model.logits"`, the exact location a user's `logits = model.logits.save()` is
+parked on. There is no registration table — a descriptor and a `provide`, and the
+two sides cannot drift out of sync because they name the same location.
 
-## 9. Extending NNsight
+The canonical reshaping example is a per-head view of an attention (or MLP)
+output. The preprocess reshapes `[B, S, H]` into `[B, n_heads, S, head_dim]`;
+the transform writes an edited view back into the module's real layout (verified
+in `tests/test_language.py`, class `Heads`):
 
-*Coming soon!*
+```python
+from nnsight import Envoy
+from nnsight.intervention.eproperty import eproperty
 
+class Heads(Envoy):
+    n_heads = 12
+
+    @eproperty(key="output")
+    def heads(self, value):
+        b, s, h = value.shape
+        return value.view(b, s, self.n_heads, h // self.n_heads).transpose(1, 2)
+
+    @heads.transform
+    def heads(self, value):
+        b, nh, s, hd = value.shape
+        return value.transpose(1, 2).reshape(b, s, nh * hd)
+
+# Wrap the root with the class directly; use envoys= for descendants.
+head_model = Heads(torch.nn.Linear(24, 24))
+with head_model.trace(torch.ones(1, 2, 24)):
+    head_model.heads[:, 5] = 0
+    head_output = head_model.output.save()
+```
+
+Here `key="output"` deliberately shares the module's `.output` location, so
+`.heads` is a second, reshaped view of the very value `.output` serves. Here
+`.view()` and `.transpose()` share storage, so in-place edits already reach the
+original tensor. The transform explicitly maps the edited value back to the
+module's layout; it becomes necessary if preprocessing creates a copy instead.
+The full recipe — including the
+non-module `tracer.result` case and the vLLM runtime values — is in
+`docs/developing/extending-envoy.md`.
+
+### 10.3 Custom envoy classes (envoys=)
+
+A custom `eproperty` only takes effect on a class that is actually used as an
+envoy. Child modules default to the base `Envoy`, so a `.heads` accessor defined
+on an `Envoy` subclass reaches a specific submodule only if that submodule is
+wrapped with the subclass. The `envoys=` argument is how you make that happen.
+
+`envoys=` is a map, threaded down the whole tree, from a module *type* or a
+dotted *path suffix* to a custom `Envoy` subclass. When each child is wrapped,
+`_resolve_envoy_class` (`src/nnsight/intervention/envoy.py`) consults the map:
+a `torch.nn.Module` subclass key is matched against the module's MRO (tried
+first, so a base class matches every subclass), and a string key matches a
+dotted path suffix (`"mlp"`, `"transformer.h"`). Anything that matches nothing
+stays the base `Envoy`. The map is inherited by children, so a single spec at the
+root applies at every depth it resolves.
+
+Run the `Heads` definition from the preceding example first.
+
+```python
+from transformers.models.gpt2.modeling_gpt2 import GPT2MLP
+
+model = TransformersModel(
+    "openai-community/gpt2", task="text-generation",
+    envoys={GPT2MLP: Heads}, dispatch=True,        # or {"mlp": Heads} by path suffix
+)
+
+model.transformer.h[0].mlp        # a Heads envoy, with a .heads eproperty
+model.transformer.h[0].attn       # untouched: still the base Envoy
+```
+
+The `Heads` class above reshapes a bare `[B, S, H]` tensor, so it fits a module
+whose `.output` *is* that tensor (a GPT-2 MLP). A module whose `.output` is a
+tuple — a GPT-2 attention block — needs a preprocess that indexes `value[0]`
+first; `docs/patterns/per-head-attention.md` carries that tuple-output variant.
+The point of `envoys=` is precisely this targeting: you attach the reshaping
+view to exactly the modules whose output layout it understands, and leave every
+other module as the plain `Envoy`. When you have no specific module to target —
+a run-level value like a runtime's logits — put the `eproperty` on the
+model/runtime subclass (or the tracer) directly instead, and skip `envoys=`
+(see [Custom hookable values (eproperty)](#102-custom-hookable-values-eproperty)).
+
+### 10.4 Custom batching
+
+The batcher (see [Batching](#72-batching)) assumes every batched activation is a
+plain dim-0 stack: the combined forward's leading dimension is the concatenation
+of each invoke's rows, so narrowing an activation to a block means slicing
+`[start, start + size)` on dim 0, and widening an edit back means splicing those
+rows in with a `cat`. That assumption is wrong for some runtimes. A diffusion
+denoiser repeats each prompt `num_images_per_prompt` times and, under
+classifier-free guidance, doubles the whole batch into an unconditional half
+followed by a conditional half; vLLM flattens tokens onto a single axis. When the
+batch axis isn't a plain dim-0 stack, you subclass `Batcher`.
+
+The base `Batcher` (`src/nnsight/intervention/batching.py`) does the container
+walk for you — recursing through tuples, lists, dicts, and HF `ModelOutput`s to
+find the tensors — and delegates the per-tensor row math to two overridable
+methods:
+
+- **`_narrow_tensor(tensor, group) -> tensor`** — slice one batched tensor down
+  to a group's rows.
+- **`_widen_tensor(full, group, edited) -> tensor`** — write an edited block's
+  rows back into the full tensor.
+
+Override those two (and, if your layout needs bookkeeping beyond the plain
+`[start, size]` group, `add`) and you get correct narrow/widen for any layout,
+because the parallel container walk and the `SkipParts` machinery are unchanged.
+Point your model at the subclass with the `_batcher_class` class attribute; the
+standard tracer instantiates `self.envoy._batcher_class(self.envoy, self.kwargs)`
+and hands it to `interleave(batcher=...)`, so setting the attribute is all the
+wiring required.
+
+`DiffusionBatcher` (`src/nnsight/modeling/diffusion.py`) is the worked example.
+It reads `num_images_per_prompt` off the trace's forward kwargs, and in `add` it
+records, alongside each invoke's plain group, an *image-expanded* group in the
+repeated batch. Its `_narrow_tensor` then picks the case by the tensor's leading
+dim at run time — an un-expanded activation (`rows == total`) narrows on the
+plain group; an image-repeated one (`rows == image_total`) narrows on the image
+group; a guidance-doubled one (`rows == image_total * 2`) narrows *both* halves
+and concatenates them, so an intervention on `model.unet` reads exactly its
+invoke's rows across the unconditional and conditional passes alike.
+`_widen_tensor` inverts each case, chunking a doubled edit back into its two
+halves. `DiffusionModel` then wires it in with a single line, `_batcher_class = DiffusionBatcher`.
+`docs/developing/batching-internals.md` covers the contract in full.
+
+### 10.5 New runtimes and backends
+
+The two words name two different extension points, and knowing which you want
+saves a lot of work.
+
+A **backend** decides *what is done with the captured block* — run it here, ship
+it to a server, serialize and replay it, log it. A **runtime** is a model type
+with its own loading, batching, or execution model — a new inference engine. If
+you want the same trace to run somewhere else, you want a backend; if you want a
+different kind of model, you want a runtime.
+
+**Backends.** A `Backend` is a one-method callable
+(`src/nnsight/tracing/backend.py`):
+
+> **Implementation excerpt:** illustrates internal contracts; it is not a standalone recipe. The example checks compile it and exercise the corresponding installed implementation.
+
+```python
+class Backend:
+    def __call__(self, tracer):
+        tracer.execute(tracer.info.code)
+```
+
+By the time your `__call__` runs, the block is already captured and compiled:
+`tracer.info.code` is the compiled block body, `tracer.info.frame` is the
+caller's live frame. You decide whether to run it (`tracer.execute(code)` — for
+an `InterleavingTracer`, that stands up the interleaver and runs the model),
+transform it, ship it, or store it. The base runs it in place; `RemoteBackend`
+skips local execution and serializes the tracer to NDIF; `LocalSimulationBackend`
+round-trips it through serialization to validate. You wire a backend in with
+`model.trace(..., backend=MyBackend())`, or, for a remote-style backend keyed off
+`remote=`, by adding a branch in your model's `Remotable._remote_backend`. The
+full recipe — including the async dual-call pattern and how saved values are
+pushed back — is `docs/developing/adding-a-new-backend.md`.
+
+**Runtimes.** A new runtime subclasses the mixin chain from
+[Subclassing NNsight and Envoy](#101-subclassing-nnsight-and-envoy) and fills in
+the underscore-prefixed extension points that make it a real model:
+
+- `_load` / `_load_meta` — construct the module (and its meta-device shape).
+- `_batch_size` / `_batch` — report each invoke's row count and combine invokes
+  into one call (see [Batching](#72-batching)); a `_batcher_class` if the batch
+  layout is exotic (see [Custom batching](#104-custom-batching)).
+- a `trace`/`_call` override to point the run at your engine's method, and an
+  `interleave` override only if your runtime doesn't run a local forward.
+- `eproperty` values for engine-internal outputs, served with `.provide` (see
+  [Custom hookable values (eproperty)](#102-custom-hookable-values-eproperty)).
+- the `Remotable` hooks (`_remoteable_model_key`, `_remoteable_persistent_objects`,
+  ...) if it should run on NDIF.
+
+`VLLM` (`src/nnsight/modeling/vllm/vllm.py`) is the deepest reference — a
+non-PyTorch engine, two processes, async and serve backends — and shows every
+one of these filled in: it starts no local workers in `interleave` (they're
+serialized onto the engine's requests), and it surfaces `.logits`/`.samples` as
+eproperties served from the model runner. `TransformersModel` and `DiffusionModel`
+are the pipeline-backed references. The full walkthrough is
+`docs/developing/adding-a-new-runtime.md`.
+
+## 11. Performance
+
+### 11.1 The overhead model
+
+nnsight's cost is per-value-access bookkeeping wrapped *around* the model's own
+compute, and the model's compute dominates by orders of magnitude. When you read
+or write a location, the machinery parks the intervention greenlet, switches to
+the model, hands off when the location is reached, narrows the
+activation to the invoke's rows, hands it to your code, takes back whatever you
+wrote, widens it back into the full batch, and switches back. That is real work —
+a greenlet switch, a hook call, a narrow/widen pair, an `eproperty`'s
+preprocess — but it is measured in microseconds and, crucially, it is **constant
+in model size**. It does not scale with parameter count.
+
+Set that against what the model does between two accesses: a single
+`torch.nn.Linear` on a real hidden size is a matmul that dwarfs thousands of
+descriptor dispatches. For any real model, where a forward pass takes
+milliseconds to seconds, the interleaving pipeline is a negligible fraction of
+wall-clock time — the overwhelming majority of a profiled trace is the model's
+own matmuls, and the interleaver/eproperty/batcher machinery is a small,
+fixed-cost sliver. The overhead only becomes visible in the opposite regime:
+tight loops over *tiny* models, where the forward itself is a handful of trivial
+matmuls and the constant pipeline cost is no longer hidden beneath it. That
+regime is exactly what the benchmark harness under `tests/performance/`
+isolates, by wrapping a stack of small linear layers so what remains in the
+timings is the pipeline rather than the model.
+
+One consequence worth internalizing: the per-module controller nnsight installs
+is persistent, but it **no-ops when you are not interleaving** — and, because it
+is the module's `forward` rather than a hook, the module stays on PyTorch's fast
+call path. A model that has been traced still carries its controllers; outside a
+`with model.trace()` block they cost one frame and one check per module call, so a
+model isn't "slowed down" by having been used with nnsight. The cost is paid per
+trace, and inside a trace it is paid per value you actually touch.
+
+### 11.2 Best practices
+
+The single largest win is **consolidating traces**. Each trace pays its setup
+cost — building the interleaver, scoping the invokes, starting and parking the
+worker greenlets — once, regardless of how much happens inside. So loop *inside*
+one trace, not many traces in a loop:
+
+```python
+import nnsight
+
+# Bad — one trace per layer, pays interleaver setup N times
+hiddens = []
+for layer in model.transformer.h:
+    with model.trace(prompt):
+        h = layer.output.save()
+    hiddens.append(h)
+
+# Good — one trace, setup paid once
+with model.trace(prompt):
+    hiddens = nnsight.save([layer.output for layer in model.transformer.h])
+```
+
+The good version also shows the **save-the-container idiom**: build the list of
+locations you want inside the trace and call `.save()` on the *container*, rather
+than saving each element separately. One saved name carries the whole list back.
+
+A few more habits keep a trace cheap and correct:
+
+- **Bound your iteration.** An unbounded `iter[:]` or `all()` runs the loop for
+  the whole generation and drops everything sequenced after it, so trailing code
+  never runs. Use a bounded `iter[:N]` when you need per-step values *and* a final
+  result afterward (see [Interleaving](#4-interleaving)).
+- **Capture forward tensors before a backward block.** A value read during the
+  forward is available inside the trace; reaching for it again after a `backward()`
+  block has run risks reading a location the model has already passed. Save it
+  while it's live.
+- **Read only what you need.** Every location you touch is a park/switch/serve
+  round trip. Saving a handful of specific outputs is cheaper than caching every
+  module — reach for `tracer.cache(...)` when you genuinely want breadth, not as a
+  default.
+- **Prefer `TransformersModel` / `NNsight`** over the deprecated aliases; that's a
+  construction-warning concern, not a runtime one, but it keeps you on the
+  supported path.
+
+The reference for all of this is `docs/developing/performance.md`.
+
+### 11.3 Profiling
+
+Because the overhead model tells you the model's own ops should dominate, the
+useful question when a trace feels slow is *where the time actually goes* — model
+compute or machinery — and a plain `cProfile` around a realistic workload
+answers it directly. Profile a function that runs the trace, not a single
+statement, and look at the cumulative time attributed to the model's forward
+versus the nnsight frames (`interleave`, `handle`, `narrow`/`widen`, the
+`eproperty` `__get__`/`__set__`).
+
+```python
+import cProfile, pstats
+
+def workload():
+    with model.trace(prompt):
+        hiddens = nnsight.save([layer.output for layer in model.transformer.h])
+    return hiddens
+
+workload()   # warm up: the first trace at a site pays block capture + compile once
+
+profiler = cProfile.Profile()
+profiler.enable()
+for _ in range(20):
+    workload()
+profiler.disable()
+pstats.Stats(profiler).sort_stats("cumulative").print_stats(30)
+```
+
+Two things make a profile trustworthy. **Warm up first** — the first trace at a
+given source location parses and compiles the block (memoized thereafter), and
+`.source`'s first access compiles the instrumented forward; both are one-time
+costs that will distort a cold profile. And, on GPU, call
+`torch.cuda.synchronize()` before and after the timed region, or the model's
+async kernels will be misattributed and the machinery will look artificially
+expensive. One more practical constraint: block capture reads the block's source
+via `inspect`, so define the trace-using function at module level in a real
+file — it will not work from `python -c "..."` or a heredoc.
+
+For comparing two nnsight trees rather than profiling your own workload, the
+harness under `tests/performance/` (`interleave_bench.py` plus `compare.py`) is
+the source of truth. It isolates each cost — capture warm vs cold, per-invoke
+slope, per-intervention slope, `.source` steady state — and reports medians in
+microseconds. Take **ratios**, not absolutes: the numbers are machine- and
+version-dependent, so a ratio near 1.0 means "the same," and any small difference
+is worth re-running before you trust it. Full documentation of the harness and
+what each benchmark isolates is in `docs/developing/performance.md`.

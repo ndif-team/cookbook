@@ -1,0 +1,10 @@
+nnsight==0.8.0rc1
+transformers>=5,<6
+accelerate
+diffusers
+peft
+pillow
+requests
+nnterp>=1.2.2,<1.4
+pytest
+pip

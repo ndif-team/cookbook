@@ -1,5 +1,9 @@
 # llms.md - NNsight AI Agent Guide
 
+Verified against **nnsight 0.8.0rc1** and **transformers 5.x**. Install with `pip install nnsight==0.8.0rc1` (or `pip install --pre nnsight`). The latest stable release is still 0.7.0 as of September 29, 2026. `LanguageModel` and `VisionLanguageModel` are deprecated aliases; use `TransformersModel` in new code.
+
+Unless stated otherwise, examples use the GPT-2 `model`, imports, and `REMOTE` setting from Quick Reference. Each example starts with a fresh model; examples that demonstrate errors are checked for those errors. `REMOTE = "local"` exercises serialization offline without an API key. NDIF still runs 0.7 during the 0.8 prerelease; `remote=True`, non-blocking jobs, and async NDIF jobs need a compatible service before they can be validated live. See [the example checks](tests/test_markdown_examples.py).
+
 This document provides comprehensive guidance for AI agents working with the `nnsight` library. NNsight enables interpreting and manipulating the internals states of deep learning models through a deferred execution tracing system.
 
 ### Related Resources
@@ -13,19 +17,15 @@ This document provides comprehensive guidance for AI agents working with the `nn
 ## Quick Reference
 
 ```python
-from nnsight import NNsight, LanguageModel
+from nnsight import NNsight, TransformersModel
+import nnsight
 import torch
 
-# For any PyTorch model
-model = NNsight(torch_model)
-
-# For HuggingFace language models
-model = LanguageModel("openai-community/gpt2", device_map="auto", dispatch=True)
-
-# Basic tracing pattern
+REMOTE = "local"  # Offline round trip; True requires an NDIF 0.8 deployment
+model = TransformersModel("openai-community/gpt2", task="text-generation", device_map="cpu", dispatch=True, attn_implementation="eager")
 with model.trace("input text"):
-    hidden_states = model.transformer.h[-1].output[0].save()  # Access and save activations
-    model.transformer.h[0].output[0][:] = 0  # Modify activations in-place
+    model.transformer.h[0].output[:] = 0
+    hidden_states = model.transformer.h[-1].output.save()
 ```
 
 ---
@@ -33,7 +33,7 @@ with model.trace("input text"):
 ## Table of Contents
 
 1. [Core Concepts](#core-concepts)
-2. [NNsight vs LanguageModel](#nnsight-vs-languagemodel)
+2. [NNsight vs TransformersModel](#nnsight-vs-transformersmodel)
 3. [Tracing Context](#tracing-context)
 4. [Accessing Activations](#accessing-activations)
 5. [Modifying Activations (Interventions)](#modifying-activations-interventions)
@@ -53,6 +53,7 @@ with model.trace("input text"):
 19. [Critical Gotchas](#critical-gotchas)
 20. [Debugging Tips](#debugging-tips)
 21. [Configuration](#configuration)
+22. [Other NNsight 0.8 Features](#other-nnsight-08-features)
 
 ---
 
@@ -60,55 +61,55 @@ with model.trace("input text"):
 
 ### Deferred Execution Model
 
-NNsight uses a **deferred execution** paradigm with **thread-based synchronization**. Here's how it works:
+NNsight uses a **deferred execution** paradigm with **greenlet-based cooperative synchronization**. Here's how it works:
 
 1. **Code extraction**: When you enter a `with model.trace(...)` block, nnsight immediately exits the block (before your code runs) and extracts/compiles your code using AST parsing
-2. **Thread execution**: Your intervention code runs in a separate worker thread
-3. **Value synchronization**: When your code accesses `.output` or `.input`, the thread **blocks and waits** until that value is available from the model
-4. **Hook-based injection**: The model's forward pass uses PyTorch hooks to provide values to waiting threads
-5. **Coordinated execution**: After providing a value, the main thread waits for the worker thread to either request another value or finish
+2. **Greenlet execution**: Your intervention code runs in a separate worker greenlet
+3. **Value synchronization**: When your code accesses `.output` or `.input`, the greenlet **parks and waits** until that value is available from the model
+4. **Hook-based injection**: The model's forward pass uses PyTorch hooks to provide values to parked greenlets
+5. **Coordinated execution**: After providing a value, the main thread waits for the worker greenlet to either request another value or finish
 
 ```python
 with model.trace("Hello"):
-    # This code is extracted, compiled, and run in a worker thread
-    # When we access .output, the thread WAITS until the model provides it
-    hs = model.transformer.h[-1].output[0]
+    # This code is extracted, compiled, and run in a worker greenlet
+    # When we access .output, the greenlet waits until the model provides it
+    hs = model.transformer.h[-1].output
     
     # .save() marks the value to persist after the context exits
     hs = hs.save()
 
 # After exiting, hs contains the actual tensor
-print(hs.shape)  # torch.Size([1, 2, 768])
+print(hs.shape)  # torch.Size([1, 1, 768])
 ```
 
-**Key insight:** Your code runs directly . When you write `torch.sum(module.output)`, that's real PyTorch code executing in a thread - it just waits for `module.output` to be available first.
+**Key insight:** Your code runs directly. When you write `torch.sum(module.output)`, that's real PyTorch code executing in a greenlet — it waits for `module.output` to be available first.
 
-### Threading Model and Invokers
+### Greenlets and Invokers
 
-Each **invoke** runs its intervention code in a separate worker thread. This is a critical architectural concept:
+Each **invoke** runs its intervention code in a separate worker greenlet. This is a critical architectural concept:
 
-1. **Each invoke is a thread** - When you call `tracer.invoke(...)`, you're creating a worker thread that runs your intervention code
-2. **Threads run serially** - Only one thread executes at a time (no race conditions)
-3. **Invokes execute in definition order** - The order you define invokes is the order they run
-4. **Threads wait for values** - When your code accesses `.input`, `.output`, or `.source`, the thread blocks until the model provides that value via hooks
-5. **Access modules in execution order** - Within an invoke, you MUST access modules in forward-pass order. Requesting layer 5's output then layer 2's output will deadlock (layer 2 already ran)
+1. **Each invoke is a greenlet** - When you call `tracer.invoke(...)`, you're creating a worker greenlet that runs your intervention code
+2. **Greenlets cooperate on one thread** - Only one greenlet executes at a time
+3. **Invokes resume at requested model locations** - Invokes are batched row groups, not separate forward passes; barriers order cross-invoke dependencies
+4. **Greenlets wait for values** - When your code accesses `.input`, `.output`, or `.source`, the greenlet parks until the model provides that value via hooks
+5. **Access modules in execution order** - Within an invoke, you MUST access modules in forward-pass order. Requesting layer 5's output then layer 2's output raises OutOfOrderError (layer 2 already ran)
 
 ```python
 with model.trace() as tracer:
-    # Invoke 1: Worker thread 1 - runs first
+    # Invoke 1: Worker greenlet for the first row group
     with tracer.invoke("Hello"):
         # Access modules in execution order ONLY
-        layer_2 = model.transformer.h[2].output.save()  # Thread waits here (OK)
+        layer_2 = model.transformer.h[2].output.save()  # Worker waits here (OK)
         layer_5 = model.transformer.h[5].output.save()  # Then waits here (OK)
 
-    # Invoke 2: Worker thread 2 - runs after thread 1 completes
+    # Invoke 2: Worker greenlet for the second row group
     with tracer.invoke("World"):
         layer_0 = model.transformer.h[0].output.save()
 ```
 /*
 !IMPORTANT:
 You MUST access modules (and their .output, .input, etc.) in the order they execute in the model's forward pass.
-Accessing layer 5's output before layer 2 will result in a deadlock or error!
+Accessing layer 5's output before layer 2 raises OutOfOrderError!
 */
 
 ### Prompt-less Invokers
@@ -141,11 +142,11 @@ This is useful for:
 
 ### Key Properties
 
-Every module wrapped by NNsight has these special properties. Accessing them causes the worker thread to **wait** until the value is available:
+Every module wrapped by NNsight has these special properties. Accessing them causes the worker greenlet to **wait** until the value is available:
 
 | Property | Description |
 |----------|-------------|
-| `.output` | The module's forward pass output (thread waits for hook) |
+| `.output` | The module's forward pass output (greenlet waits for hook) |
 | `.input` | The first positional argument to the module |
 | `.inputs` | All inputs as `(tuple(args), dict(kwargs))` |
 
@@ -153,7 +154,7 @@ Every module wrapped by NNsight has these special properties. Accessing them cau
 
 ---
 
-## NNsight vs LanguageModel
+## NNsight vs TransformersModel
 
 ### NNsight (Base Class)
 
@@ -174,54 +175,54 @@ with model.trace(torch.rand(1, 5)):
     output = model.output.save()
 ```
 
-### LanguageModel (HuggingFace Integration)
+### TransformersModel (HuggingFace Integration)
 
-Use `LanguageModel` for HuggingFace transformers with automatic tokenization:
+Use `TransformersModel` for HuggingFace transformers with automatic tokenization:
 
 ```python
-from nnsight import LanguageModel
+from nnsight import TransformersModel
 
 # Loads model + tokenizer automatically
-model = LanguageModel("openai-community/gpt2", device_map="auto", dispatch=True)
+model = TransformersModel("openai-community/gpt2", task="text-generation", device_map="auto", dispatch=True)
 
 # Can pass strings directly - tokenization is handled
 with model.trace("The Eiffel Tower is in"):
-    hidden_states = model.transformer.h[-1].output[0].save()
+    hidden_states = model.transformer.h[-1].output.save()
 ```
 
-**How LanguageModel Works:**
+**How TransformersModel Works:**
 
-`LanguageModel` is a thin wrapper around HuggingFace's `transformers` library. Under the hood, it uses `AutoModelForCausalLM.from_pretrained()` (or similar Auto classes) to load the model. This means:
+`TransformersModel` is backed by a HuggingFace `transformers.pipeline`. The task selects the model class and preprocessing, so the same wrapper handles text generation, fill-mask, classification, vision, and audio. This means:
 
-1. **Keyword arguments are forwarded** - Any kwargs you pass to `LanguageModel()` are forwarded directly to the underlying HuggingFace loading function
+1. **Keyword arguments are forwarded** - Loading options such as `dtype`, `device_map`, and `attn_implementation` are routed through the pipeline; preprocessing and generation have their own arguments
 2. **Same model, enhanced interface** - The wrapped model is identical to what you'd get from `transformers`, but with NNsight's intervention capabilities added
 3. **Tokenizer included** - The appropriate tokenizer is loaded automatically alongside the model
 
 ```python
 # These kwargs are passed directly to AutoModelForCausalLM.from_pretrained()
-model = LanguageModel(
-    "meta-llama/Llama-3.1-8B",
+model = TransformersModel(
+    "openai-community/gpt2", task="text-generation",
     device_map="auto",           # HuggingFace accelerate device mapping
-    torch_dtype=torch.float16,   # Precision setting
+    dtype=torch.float16,   # Precision setting
     trust_remote_code=True,      # For custom model code
-    attn_implementation="flash_attention_2",  # Attention backend
+    attn_implementation="eager",  # Attention backend (portable on CPU)
 )
 ```
 
-**Important `LanguageModel` parameters:**
+**Important `TransformersModel` parameters:**
 
 | Parameter | Description |
 |-----------|-------------|
 | `device_map` | Device placement - `"auto"` distributes layers across available GPUs (and CPU if needed). Uses HuggingFace Accelerate. Other options: `"cuda"`, `"cpu"`, or a custom dict |
-| `dispatch=True` | Load model weights into memory immediately. Default is lazy loading (meta tensors) which is faster for initialization but requires dispatch before use |
-| `torch_dtype` | Model precision (e.g., `torch.float16`, `torch.bfloat16`). Forwarded to HuggingFace |
+| `dispatch=True` | Load model weights into memory immediately. Default is lazy loading (meta tensors); the first local trace dispatches automatically |
+| `dtype` | Model precision (e.g., `torch.float16`, `torch.bfloat16`). Forwarded to HuggingFace |
 | `rename={...}` | Create module aliases (see [Module Renaming](#module-renaming)) |
 
 **Note on `device_map="auto"`:** This tells HuggingFace Accelerate to automatically distribute model layers across all available GPUs. If the model doesn't fit on GPUs, it will offload to CPU. This is the recommended setting for large models.
 
 **Wrapping pre-loaded models:**
 
-You can wrap an existing HuggingFace model, but **you must provide the tokenizer**:
+You can wrap an existing HuggingFace model. Pass its tokenizer explicitly, or let the pipeline load it from the model's `name_or_path`:
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -230,14 +231,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 hf_model = AutoModelForCausalLM.from_pretrained("gpt2")
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
-# MUST provide tokenizer
-model = LanguageModel(hf_model, tokenizer=tokenizer)
+# Explicit tokenizer avoids relying on name_or_path inference
+model = TransformersModel(hf_model, tokenizer=tokenizer)
 ```
 
-Without `tokenizer=`, you'll get:
+A model constructed from a config may have no usable `name_or_path`; provide `tokenizer=` in that case. A pretrained GPT-2 model with its checkpoint name still attached can load the tokenizer automatically.
+
 ```
-AttributeError: Tokenizer not found. If you passed a pre-loaded model to 
-`LanguageModel`, you need to provide a tokenizer when initializing.
+pretrained model with usable name_or_path -> tokenizer can be inferred
+model without usable name_or_path -> provide tokenizer explicitly
 ```
 
 ---
@@ -252,8 +254,8 @@ with model.trace("Hello World"):
     output = model.output.save()
 
 # With generation (for multi-token output)
-with model.generate("Hello", max_new_tokens=5):
-    output = model.generator.output.save()
+with model.generate("Hello", max_new_tokens=5, min_new_tokens=5) as tracer:
+    output = tracer.result.save()
 ```
 
 ### Trace With vs Without Invokes
@@ -271,8 +273,11 @@ with model.trace() as tracer:
         output = model.output.save()
 
 # WRONG - no positional arg and no invokes
-with model.trace():  # Error!
-    output = model.output.save()
+try:
+    with model.trace():
+        output = model.output.save()
+except ValueError:
+    print("Provide an input or an explicit invoke")
 ```
 
 When you provide an argument to `.trace()`, an implicit invoke is created for you. This is equivalent to:
@@ -293,7 +298,7 @@ The tracing context returns a `tracer` object with useful methods:
 
 ```python
 with model.trace("Hello") as tracer:
-    print("Debug:", model.layer1.output.shape)  # Print works normally
+    print("Debug:", model.transformer.h[0].output.shape)  # Print works normally
     tracer.stop()  # Early termination
 ```
 
@@ -324,16 +329,9 @@ print(model)
 
 ```python
 with model.trace("Hello"):
-    # Access specific layer output
-    layer_5_out = model.transformer.h[5].output[0].save()
-    
-    # Access attention output
     attn_out = model.transformer.h[0].attn.output[0].save()
-    
-    # Access MLP output  
     mlp_out = model.transformer.h[0].mlp.output.save()
-    
-    # Access final logits
+    layer_5_out = model.transformer.h[5].output.save()
     logits = model.lm_head.output.save()
 ```
 
@@ -350,31 +348,26 @@ with model.trace("Hello"):
 
 ### The `.save()` Method
 
-**Critical:** Values are garbage collected unless you call `.save()`:
+**Critical:** Trace-local variable bindings are only exported when saved. `.save()` must be called inside a trace and assigned to a variable:
 
 ```python
 with model.trace("Hello"):
     # WRONG - value will be lost
-    output = model.transformer.h[-1].output[0]
+    output = model.transformer.h[-1].output
 
     # CORRECT - value persists after context
-    output = model.transformer.h[-1].output[0].save()
+    output = model.transformer.h[-1].output.save()
 ```
 
 **Two ways to save:**
 
 ```python
-# Method 1: .save() on tensor (uses pymount C extension)
-output = model.transformer.h[-1].output[0].save()
-
-# Method 2: nnsight.save() - PREFERRED (works for all objects)
 import nnsight
-output = nnsight.save(model.transformer.h[-1].output[0])
+with model.trace("Hello"):
+    output = model.transformer.h[-1].output.save()
 
-# nnsight.save() is preferred because:
-# - Works on any object (including those with their own .save() method)
-# - Doesn't require the pymount C extension
-# - More explicit about what's happening
+with model.trace("Hello"):
+    output = nnsight.save(model.transformer.h[-1].output)
 ```
 
 ---
@@ -388,11 +381,11 @@ Use slice assignment for in-place modifications:
 ```python
 with model.trace("Hello"):
     # Zero out all activations
-    model.transformer.h[0].output[0][:] = 0
+    model.transformer.h[0].output[:] = 0
     
     # Modify specific positions
-    model.transformer.h[0].output[0][:, -1, :] = 0  # Last token only
-    model.transformer.h[0].output[0][:, :, 0] = 1   # First hidden dim
+    model.transformer.h[0].output[:, -1, :] = 0  # Last token only
+    model.transformer.h[0].output[:, :, 0] = 1   # First hidden dim
 ```
 
 ### Replacement
@@ -401,13 +394,9 @@ Use direct assignment to replace the entire output:
 
 ```python
 with model.trace("Hello"):
-    # Clone and modify
-    hs = model.transformer.h[0].output[0].clone()
-    hs = hs * 2
-    model.transformer.h[0].output[0] = hs
-    
-    # Or with torch operations
     model.transformer.wte.output = model.transformer.wte.output * 0.5
+    hs = model.transformer.h[0].output.clone()
+    model.transformer.h[0].output = hs * 2
 ```
 
 ### Tuple Outputs
@@ -416,13 +405,11 @@ Many modules return tuples. Handle carefully:
 
 ```python
 with model.trace("Hello"):
-    # GPT2 transformer blocks return (hidden_states, attention_weights, ...)
-    full_output = model.transformer.h[0].output  # This is a tuple
-    
-    # Replace entire tuple
-    model.transformer.h[0].output = (
-        torch.zeros_like(model.transformer.h[0].output[0]),
-    ) + model.transformer.h[0].output[1:]
+    # GPT-2 attention returns a tuple; GPT-2 blocks return a Tensor in transformers 5.x.
+    full_output = model.transformer.h[0].attn.output
+    model.transformer.h[0].attn.output = (
+        torch.zeros_like(full_output[0]),
+    ) + full_output[1:]
 ```
 
 ### Clone Before Saving Modified Values
@@ -432,29 +419,32 @@ If you modify in-place and want to see the "before" state:
 ```python
 with model.trace("Hello"):
     # Clone BEFORE the modification
-    before = model.transformer.h[0].output[0].clone().save()
+    before = model.transformer.h[0].output.clone().save()
     
-    model.transformer.h[0].output[0][:] = 0
+    model.transformer.h[0].output[:] = 0
     
-    after = model.transformer.h[0].output[0].save()
+    after = model.transformer.h[0].output.save()
 ```
 
 ---
 
 ## Batching with Invokers
 
-Process multiple inputs in a single forward pass using invokers. Remember: **each invoke is a separate logical thread** that runs serially in definition order.
+Process multiple inputs in a single forward pass using invokers. Remember: **each invoke is a separate logical greenlet** that runs serially in definition order.
 
 ```python
 with model.trace() as tracer:
-    # First invoke: Thread 1 - runs first
+    barrier = tracer.barrier(2)
+    # First invoke: first row group
     with tracer.invoke("The Eiffel Tower is in"):
         embeddings = model.transformer.wte.output
+        barrier()
         output1 = model.lm_head.output.save()
     
-    # Second invoke: Thread 2 - runs after Thread 1 completes
+    # Second invoke: second row group
     # Can reference values from first invoke
     with tracer.invoke("_ _ _ _ _ _ _"):
+        barrier()
         model.transformer.wte.output = embeddings  # Cross-invoke intervention
         output2 = model.lm_head.output.save()
 ```
@@ -471,9 +461,9 @@ with model.trace() as tracer:
     with tracer.invoke("World"):
         pass
     
-    # No-arg invoke: new thread that sees the combined batch
+    # No-arg invoke: worker that sees the combined batch
     with tracer.invoke():
-        # Can access modules in any order (separate thread)
+        # This worker must also access modules in execution order
         all_outputs = model.lm_head.output.save()  # Shape: [2, seq, vocab]
 ```
 
@@ -482,18 +472,18 @@ with model.trace() as tracer:
 When you need values from one invoke before another proceeds:
 
 ```python
-with model.generate(max_new_tokens=3) as tracer:
+with model.generate(max_new_tokens=3, min_new_tokens=3) as tracer:
     barrier = tracer.barrier(2)  # Create barrier for 2 invokes
     
     with tracer.invoke("Madison Square Garden is in the city of"):
         embeddings = model.transformer.wte.output
         barrier()  # Wait here
-        output1 = model.generator.output.save()
+        output1 = tracer.result.save()
     
     with tracer.invoke("_ _ _ _ _ _ _ _ _"):
         barrier()  # Wait here
         model.transformer.wte.output = embeddings  # Now safe to use
-        output2 = model.generator.output.save()
+        output2 = tracer.result.save()
 ```
 
 ### Batched Inputs
@@ -516,13 +506,10 @@ with model.trace() as tracer:
 ### Using `.generate()`
 
 ```python
-with model.generate("Hello", max_new_tokens=5) as tracer:
-    # Interventions here apply to ALL generation steps by default
-    hidden_states = model.transformer.h[-1].output[0].save()
-    
-    # Get the generated output
-    output = model.generator.output.save()
-
+with model.generate("Hello", max_new_tokens=5, min_new_tokens=5, do_sample=False) as tracer:
+    # Without an iteration loop, interventions target the first occurrence.
+    hidden_states = model.transformer.h[-1].output.save()
+    output = tracer.result.save()
 decoded = model.tokenizer.decode(output[0])
 ```
 
@@ -533,114 +520,107 @@ Use `tracer.iter[...]` to access specific generation steps. The `iter` property 
 - **Int**: `tracer.iter[2]` (step 2 only)
 - **List**: `tracer.iter[[0, 2, 4]]` (specific steps)
 
-Each `iter` moves a cursor that tracks which generation step the mediator (worker thread) is requesting.
+Each iteration moves a cursor that selects the module occurrence requested by the mediator. The `for` form is preferred; the older `with tracer.iter[...]` form is deprecated.
 
 ```python
-with model.generate("Hello", max_new_tokens=5) as tracer:
+with model.generate("Hello", max_new_tokens=5, min_new_tokens=5) as tracer:
     logits = list().save()
     
     # All steps (slice)
-    with tracer.iter[:]:
+    for step in tracer.iter[:]:
         logits.append(model.lm_head.output[0][-1].argmax(dim=-1))
     
 # Or specific steps
-with model.generate("Hello", max_new_tokens=5) as tracer:
+with model.generate("Hello", max_new_tokens=5, min_new_tokens=5) as tracer:
     logits = list().save()
     
     # Steps 1-3 only (slice)
-    with tracer.iter[1:3]:
+    for step in tracer.iter[1:3]:
         logits.append(model.lm_head.output)
 
 # Single step (int)
-with model.generate("Hello", max_new_tokens=5) as tracer:
-    with tracer.iter[0]:
+with model.generate("Hello", max_new_tokens=5, min_new_tokens=5) as tracer:
+    for step in tracer.iter[0]:
         first_logits = model.lm_head.output.save()
 
 # Specific steps (list)
-with model.generate("Hello", max_new_tokens=5) as tracer:
+with model.generate("Hello", max_new_tokens=5, min_new_tokens=5) as tracer:
     logits = list().save()
-    with tracer.iter[[0, 2, 4]]:
+    for step in tracer.iter[[0, 2, 4]]:
         logits.append(model.lm_head.output)
 ```
 
 ### Conditional Interventions Per Step
 
 ```python
-with model.generate("Hello", max_new_tokens=5) as tracer:
+with model.generate("Hello", max_new_tokens=5, min_new_tokens=5) as tracer:
     outputs = list().save()
     
-    with tracer.iter[:] as step_idx:
+    for step_idx in tracer.iter[:]:
         if step_idx == 2:
             # Only intervene on step 2
-            model.transformer.h[0].output[0][:] = 0
+            model.transformer.h[0].output[:] = 0
         
-        outputs.append(model.transformer.h[-1].output[0])
+        outputs.append(model.transformer.h[-1].output)
 ```
 
 ### Using `.all()` for Recursive Application
 
 ```python
-with model.generate("Hello", max_new_tokens=3) as tracer:
+with model.generate("Hello", max_new_tokens=3, min_new_tokens=3) as tracer:
     hidden_states = list().save()
     
     # Apply to all generation steps for all descendants
-    with tracer.all():
-        model.transformer.h[0].output[0][:] = 0
+    for step in tracer.all():
+        model.transformer.h[0].output[:] = 0
         hidden_states.append(model.transformer.h[-1].output)
 ```
 
 ### Using `.next()` for Manual Stepping
 
+The `.next()` API was removed in 0.8. Select specific occurrences with `tracer.iter`:
+
 ```python
-with model.generate("Hello", max_new_tokens=3) as tracer:
-    # First token
-    hs1 = model.transformer.h[-1].output[0].save()
-    
-    # Second token
-    hs2 = model.transformer.h[-1].next().output[0].save()
-    
-    # Third token
-    hs3 = model.transformer.h[-1].next().output[0].save()
+with model.generate("Hello", max_new_tokens=3, min_new_tokens=3, do_sample=False) as tracer:
+    hidden_states = nnsight.save([])
+    for step in tracer.iter[[0, 1, 2]]:
+        hidden_states.append(model.transformer.h[-1].output)
+    output = tracer.result.save()
 ```
 
 ### ⚠️ Critical Footgun: Unbounded Iteration
 
-**When using `tracer.iter[:]` or `tracer.all()`, code AFTER the iter block never executes.**
-
-These unbounded iterators don't know when to stop — they wait forever for the "next" iteration. When generation finishes:
-
-1. The iterator is still waiting for more iterations
-2. NNsight issues a warning (not an error)
-3. **All code after the iter block is skipped**
+An open-ended `tracer.iter[:]` or `tracer.all()` loop waits for a location after the last generated step. Values saved inside the loop survive, but code after the loop does not execute. A bounded loop can also be cut short by EOS; use `min_new_tokens` when the example requires a fixed count.
 
 ```python
-# WRONG:
-with model.generate("Hello", max_new_tokens=3) as tracer:
-    with tracer.iter[:]:
+with model.generate("Hello", max_new_tokens=3, min_new_tokens=3) as tracer:
+    for step in tracer.iter[:]:
         hidden = model.transformer.h[-1].output.save()
-    
-    # ⚠️ THIS NEVER EXECUTES!
-    final_logits = model.output.save()
+    final_logits = tracer.result.save()  # Not reached
 
-print(final_logits)  # NameError: 'final_logits' is not defined
+assert "final_logits" not in locals()  # Expected missing binding
 ```
 
-**Solutions:**
+Use a bounded loop when you know the count:
 
-1. **Use a separate empty invoker** (recommended):
-   ```python
-   with model.generate("Hello", max_new_tokens=3) as tracer:
-       with tracer.invoke():  # First invoker - handles iteration
-           with tracer.iter[:]:
-               hidden = model.transformer.h[-1].output.save()
-       
-       with tracer.invoke():  # Second invoker - runs after generation
-           final_logits = model.output.save()  # Now runs!
-   ```
-2. **Use bounded iteration** if you know the count: `tracer.iter[:3]`
-3. **Use `tracer.next()`** for explicit step control
+```python
+with model.generate("Hello", max_new_tokens=3, min_new_tokens=3) as tracer:
+    hidden_states = nnsight.save([])
+    for step in tracer.iter[:3]:
+        hidden_states.append(model.transformer.h[-1].output)
+    output = tracer.result.save()
+```
 
----
+For an open-ended loop, give the result its own empty invoke. Set up the input through an explicit invoke; nesting `tracer.invoke()` inside a trace that already has an implicit input invoke is invalid:
+
+```python
+with model.generate(max_new_tokens=3, min_new_tokens=3) as tracer:
+    with tracer.invoke("Hello"):
+        for step in tracer.iter[:]:
+            hidden = model.transformer.h[-1].output.save()
+    with tracer.invoke():
+        output = tracer.result.save()
+```
 
 ## Gradients and Backpropagation
 
@@ -673,7 +653,7 @@ If you accessed `layer5.output` and `layer10.output` during the forward pass, yo
 ```python
 with model.trace("Hello"):
     # Get the tensor and enable gradients
-    hs = model.transformer.h[-1].output[0]
+    hs = model.transformer.h[-1].output
     hs.requires_grad_(True)
     
     logits = model.lm_head.output
@@ -691,7 +671,7 @@ print(grad.shape)  # Now contains the gradient
 
 ```python
 with model.trace("Hello"):
-    hs = model.transformer.h[-1].output[0]
+    hs = model.transformer.h[-1].output
     hs.requires_grad_(True)
     
     logits = model.lm_head.output
@@ -709,7 +689,7 @@ with model.trace("Hello"):
 
 ```python
 with model.trace("Hello"):
-    hs = model.transformer.h[-1].output[0]
+    hs = model.transformer.h[-1].output
     hs.requires_grad_(True)
     logits = model.lm_head.output
     
@@ -729,7 +709,7 @@ You can also use backward tracing on its own, without wrapping it in a `model.tr
 ```python
 # First, run a forward pass to get tensors
 with model.trace("Hello"):
-    hs = model.transformer.h[-1].output[0]
+    hs = model.transformer.h[-1].output
     hs.requires_grad_(True)
     hs = hs.save()  # Save the tensor for later
     logits = model.lm_head.output.save()
@@ -754,13 +734,13 @@ Standard Python `if` statements work inside tracing contexts:
 
 ```python
 with model.trace("Hello") as tracer:
-    output = model.transformer.h[0].output[0]
+    output = model.transformer.h[0].output
     
     # Python conditionals work with real tensor values
     if torch.all(output < 100000):
-        model.transformer.h[-1].output[0][:] = 0
+        model.transformer.h[-1].output[:] = 0
     
-    result = model.transformer.h[-1].output[0].save()
+    result = model.transformer.h[-1].output.save()
 ```
 
 ### Session-Level Conditionals
@@ -768,10 +748,10 @@ with model.trace("Hello") as tracer:
 ```python
 with model.session() as session:
     with model.trace("Hello"):
-        if torch.all(model.transformer.h[5].output[0] < 100000):
-            model.transformer.h[-1].output[0][:] = 0
+        if torch.all(model.transformer.h[5].output < 100000):
+            model.transformer.h[-1].output[:] = 0
         
-        output = model.transformer.h[-1].output[0].save()
+        output = model.transformer.h[-1].output.save()
 ```
 
 ### Python Loops
@@ -795,27 +775,27 @@ Create persistently modified versions of a model:
 
 ```python
 # Non-inplace editing (creates a new model reference)
-with model.edit() as model_edited:
-    model.transformer.h[1].output[0][:, 1] = 0
+with model.edit() as (tracer, model_edited):
+    model_edited.transformer.h[1].output[:] = 0
 
 # Use original model
 with model.trace("Hello"):
-    out1 = model.transformer.h[1].output[0].save()
+    out1 = model.transformer.h[1].output.save()
 
 # Use edited model
 with model_edited.trace("Hello"):
-    out2 = model_edited.transformer.h[1].output[0].save()
+    out2 = model_edited.transformer.h[1].output.save()
 ```
 
 ### In-Place Editing
 
 ```python
 with model.edit(inplace=True):
-    model.transformer.h[1].output[0][:] = 0
+    model.transformer.h[1].output[:] = 0
 
 # Now ALL traces use the edited model
 with model.trace("Hello"):
-    output = model.transformer.h[1].output[0].save()  # Will be zeros
+    output = model.transformer.h[1].output.save()  # Will be zeros
 ```
 
 ### Clearing Edits
@@ -836,22 +816,22 @@ Get shapes and types without running the full model:
 ```python
 with model.scan("Hello"):
     # Access shape information
-    dim = model.transformer.h[0].output[0].shape[-1]
+    dim = nnsight.save(model.transformer.h[0].output.shape[-1])
     
 print(dim)  # e.g., 768
 ```
 
 ### Validation Mode
 
-Test interventions with fake tensors:
+Use `.scan()` with fake tensors to check shapes. This deliberately invalid position is caught before real computation:
 
 ```python
-# Validate interventions before running
-with model.scan("Hello"):
-    model.transformer.h[0].output[0][:, 10] = 0  # Will fail if dim < 11
+try:
+    with model.scan("Hello"):
+        model.transformer.h[0].output[:, 10] = 0
+except IndexError:
+    print("Invalid sequence position caught")
 ```
-
----
 
 ## Caching Activations
 
@@ -892,7 +872,7 @@ layer1_input = cache['model.transformer.h.1'].inputs
 with model.trace("Hello") as tracer:
     cache = tracer.cache()  # Must call BEFORE interventions
     
-    model.transformer.h[0].output[0][:] = 0
+    model.transformer.h[0].output[:] = 0
 
 # Cache contains the modified values
 assert torch.all(cache['model.transformer.h.0'].output[0] == 0)
@@ -906,7 +886,7 @@ with model.trace("Hello") as tracer:
 
 # Both work:
 out1 = cache['model.transformer.h.0'].output
-out2 = cache.model.transformer.h[0].output
+out2 = cache.transformer.h[0].output
 ```
 
 ---
@@ -924,168 +904,143 @@ out2 = cache.model.transformer.h[0].output
 
 ### Discovering Available Operations
 
-Print `.source` to see the forward method with operation names highlighted:
+Print `.source` before tracing to discover the names in your installed transformers version:
 
 ```python
-# Outside a trace - discover operations
 print(model.transformer.h[0].attn.source)
-
-# Output shows operation names and line numbers:
-#                                    60
-#                                    61     if using_eager and self.reorder_and_upcast_attn:
-#   self__upcast_and_reordered_attn_0 -> 62         attn_output, attn_weights = self._upcast_and_reordered_attn(
-#                                    63             query_states, key_states, value_states, attention_mask, head_mask
-#                                    64         )
-#                                    65     else:
-#   attention_interface_0             -> 66         attn_output, attn_weights = attention_interface(
-#                                    ...
-#   attn_output_reshape_0             -> 78     attn_output = attn_output.reshape(...)
-#   self_c_proj_0                     -> 79     attn_output = self.c_proj(attn_output)
-#   self_resid_dropout_0              -> 80     attn_output = self.resid_dropout(attn_output)
 ```
 
 ### Viewing a Specific Operation
 
-Print a specific operation to see it with surrounding context:
+In transformers 5.x, `attention_interface_0` selects the function and `attention_interface_1` calls it:
 
 ```python
-print(model.transformer.h[0].attn.source.attention_interface_0)
-
-# Output shows the operation highlighted:
-# .transformer.h.0.attn.attention_interface_0:
-#
-#      ....
-#
-#          if using_eager and self.reorder_and_upcast_attn:
-#              attn_output, attn_weights = self._upcast_and_reordered_attn(
-#                  query_states, key_states, value_states, attention_mask, head_mask
-#              )
-#          else:
-#      -->     attn_output, attn_weights = attention_interface( <--
-#                  self,
-#                  query_states,
-#                  key_states,
-#      ....
+print(model.transformer.h[0].attn.source.attention_interface_1)
 ```
 
 ### Accessing Operation Values
 
-Inside a trace, access operations like any module:
+Read an operation's inputs before its output, just as you would for a module:
 
 ```python
 with model.trace("Hello"):
-    # Access operation output
-    attn_out = model.transformer.h[0].attn.source.attention_interface_0.output.save()
-    
-    # Access operation inputs (args, kwargs)
-    attn_args, attn_kwargs = model.transformer.h[0].attn.source.attention_interface_0.inputs
-    
-    # Modify operation output
+    attn_args, attn_kwargs = model.transformer.h[0].attn.source.attention_interface_1.inputs
+    attn_out = model.transformer.h[0].attn.source.attention_interface_1.output.save()
     model.transformer.h[0].attn.source.self_c_proj_0.output[:] = 0
 ```
 
 ### Recursive Source Tracing
 
-You can trace into operations that call other functions:
+You can trace into operations that call other functions. With eager GPT-2 attention, probabilities pass through functional dropout:
 
 ```python
 with model.trace("Hello"):
-    # Access nested internal operations
-    sdpa_out = (
-        model.transformer.h[0].attn
-        .source.attention_interface_0
-        .source.torch_nn_functional_scaled_dot_product_attention_0
-        .output.save()
+    attention_weights = (
+        model.transformer.h[0].attn.source.attention_interface_1
+        .source.nn_functional_dropout_0.output.save()
     )
 ```
 
-**Note:** Don't call `.source` on a module from within another `.source`. Access it directly:
+Access a submodule's source directly through its Envoy. Operation names depend on the installed model source:
 
 ```python
-# WRONG
-model.transformer.h[0].attn.source.some_submodule.source  # Error!
-
-# CORRECT - access the submodule directly
-model.transformer.h[0].attn.some_submodule.source
+print(model.transformer.h[0].attn.c_proj.source)
 ```
-
----
 
 ## Module Skipping
 
-Skip a module's computation entirely:
+Skip a module's computation entirely, supplying a replacement output of the correct structure:
 
 ```python
 with model.trace("Hello"):
-    # Get output from layer 0
-    layer0_out = model.transformer.h[0].output
-    
-    # Skip layer 1 entirely, using layer 0's output as layer 1's output
+    layer0_out = model.transformer.h[0].output.save()
     model.transformer.h[1].skip(layer0_out)
-    
-    # Layer 1's output now equals layer 0's output
     layer1_out = model.transformer.h[1].output.save()
-
-assert torch.equal(layer0_out[0], layer1_out[0])
+assert torch.equal(layer0_out, layer1_out)
 ```
 
-### Skipping Constraints
-
-- Cannot access inner modules of a skipped module
-- Skips must respect execution order (can't skip backwards)
-
----
+Inner modules of a skipped module never run. Skips respect execution order and affect the full batched module call; do not treat a skip as an independent per-row forward.
 
 ## vLLM Integration
 
-NNsight supports vLLM for high-performance inference:
+Use a vLLM wheel and PyTorch build compiled for the same CUDA version; the unqualified extra can select a wheel that does not match an existing Colab environment. Follow the [official GPU installation guide](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/).
+
+Install `nnsight[vllm]==0.8.0rc1` on a supported Linux CUDA machine. These examples use one GPU and a small public model. vLLM activations have no batch axis: each worker sees its request's rows in a flat token slab. Clone saved activations because vLLM reuses buffers. In a Python script, construct and run the engine under an `if __name__ == "__main__":` guard; notebook cells do not need that guard.
 
 ```python
 from nnsight.modeling.vllm import VLLM
 
-model = VLLM("gpt2", tensor_parallel_size=1, gpu_memory_utilization=0.1, dispatch=True)
+model = VLLM(
+    "openai-community/gpt2", tensor_parallel_size=1, dispatch=True,
+    dtype="float16", gpu_memory_utilization=0.3, max_model_len=64,
+)
 ```
 
 ### Basic vLLM Tracing
 
-```python
-with model.trace("The Eiffel Tower is in", temperature=0.0, top_p=1):
-    logits = model.logits.output.save()
+`logits` and `samples` are hookable values, not modules: use `model.logits`, not `model.logits.output`.
 
+```python
+with model.trace("The Eiffel Tower is in", temperature=0.0, max_tokens=1):
+    logits = model.logits.clone().save()
 next_token = model.tokenizer.decode(logits.argmax(dim=-1))
 ```
 
 ### vLLM Multi-Token Generation
 
 ```python
-with model.trace("Hello", max_tokens=5) as tracer:
-    logits = list().save()
-    
-    with tracer.iter[:]:
-        logits.append(model.logits.output)
+with model.trace("Hello", max_tokens=3, min_tokens=3, temperature=0.0) as tracer:
+    logits = nnsight.save([])
+    for step in tracer.iter[:3]:
+        logits.append(model.logits.clone())
 ```
 
 ### vLLM Interventions
 
 ```python
-with model.trace("The Eiffel Tower is in", temperature=0.0, top_p=1):
-    # Modify hidden states
-    model.transformer.h[-2].mlp.output = torch.zeros_like(
-        model.transformer.h[-2].mlp.output
-    )
-    
-    logits = model.logits.output.save()
+with model.trace("The Eiffel Tower is in", temperature=0.0, max_tokens=1):
+    hidden = model.transformer.h[8].output.clone().save()
+    model.transformer.h[8].output[:] = 0
+    logits = model.logits.clone().save()
 ```
 
 ### vLLM Sampling
 
 ```python
-with model.trace(max_tokens=3) as tracer:
+with model.trace(max_tokens=3, min_tokens=3) as tracer:
     with tracer.invoke("Hello", temperature=0.8, top_p=0.95):
-        samples = list().save()
-        with tracer.iter[:]:
-            samples.append(model.samples.output.item())
+        samples = nnsight.save([])
+        for step in tracer.iter[:3]:
+            samples.append(model.samples.item())
 ```
+
+### CUDA Graph Taps
+
+An eager engine exposes every location. `taps=` enables breakable CUDA graphs and exposes only the declared locations during replay; it requires a vLLM version with breakable-graph support. Keep the tap set small. Source-operation paths can also be tapped. The GPU checks use vLLM 0.26.0 with its official CUDA 12.9 wheel, matching PyTorch 2.11.0, torchvision, torchaudio, and TorchCodec builds on a Colab T4.
+
+```python
+tapped_model = VLLM(
+    "openai-community/gpt2", dispatch=True,
+    dtype="float16", gpu_memory_utilization=0.3, max_model_len=64,
+    taps=["transformer.h.8.output"],
+)
+with tapped_model.trace("Hello", max_tokens=1, temperature=0.0):
+    hidden = tapped_model.transformer.h[8].output.clone().save()
+```
+
+### Persistent Engine Edits
+
+vLLM edits are installed on the engine and apply to later ordinary requests. Saves arrive on each finished request's `.saves` dictionary.
+
+```python
+with model.edit() as (tracer, edit):
+    hidden = model.transformer.h[8].output.clone().save()
+outputs = model.generate(["Hello", "The capital of Japan is"], max_tokens=1, temperature=0.0)
+captured_hidden = outputs[1].saves["hidden"]
+model.clear_edits()
+```
+
+For streaming, construct `VLLM(..., mode="async")` and consume `async for output in tracer.backend` (an attribute, not a call). Finished outputs carry their saves. The `serve` extra supplies `nnsight-serve`, allowing clients without a GPU to trace an engine over HTTP. See the [vLLM guide](https://nnsight.net/models/vllm/) for tensor parallelism, async execution, serving, and architecture-specific residual tuples.
 
 ---
 
@@ -1098,26 +1053,23 @@ Run interventions on NDIF's remote infrastructure without local GPU resources.
 ```python
 from nnsight import CONFIG
 import nnsight
+import os
 
-# Set API key (get from login.ndif.us)
-CONFIG.set_default_api_key("YOUR_API_KEY")
-
-# Check available models
-nnsight.ndif_status()
-
-# Check if specific model is running (may return False even if available)
-nnsight.is_model_running("openai-community/gpt2")
+# For NDIF, set NDIF_API_KEY in your environment (or use `nnsight login`).
+# Offline examples require no key.
+if os.environ.get("NDIF_API_KEY"):
+    CONFIG.API.APIKEY = os.environ["NDIF_API_KEY"]
 ```
 
 ### Basic Remote Tracing
 
 ```python
 # Model loads on 'meta' device - no local GPU memory used
-model = LanguageModel("meta-llama/Llama-3.1-8B")
+model = TransformersModel("openai-community/gpt2", task="text-generation")
 print(model.device)  # "meta"
 
-# Add remote=True to execute on NDIF
-with model.trace("The Eiffel Tower is in the city of", remote=True):
+# REMOTE="local" validates serialization and runs locally; True uses NDIF
+with model.trace("The Eiffel Tower is in the city of", remote=REMOTE):
     logit = model.lm_head.output[0][-1].argmax(dim=-1).save()
 
 print(model.tokenizer.decode(logit))  # "Paris"
@@ -1126,21 +1078,17 @@ print(model.tokenizer.decode(logit))  # "Paris"
 ### Remote Generation
 
 ```python
-with model.generate("Hello", max_new_tokens=5, remote=True) as tracer:
-    # Use tracer.result for generation output
+with model.generate("Hello", max_new_tokens=5, min_new_tokens=5, remote=REMOTE) as tracer:
+    logits = nnsight.save([])
+    for step in tracer.iter[:5]:
+        logits.append(model.lm_head.output[0, -1].argmax(-1))
     output = tracer.result.save()
-    
-    # Or iterate over generation steps
-    logits = list().save()
-    with tracer.iter[:]:
-        logits.append(model.lm_head.output[0][-1].argmax(dim=-1))
-
 print(model.tokenizer.decode(output[0]))
 ```
 
 ### Request Lifecycle
 
-When you run a remote trace, you'll see status updates:
+With `remote=True` on a compatible NDIF deployment, you'll see status updates. The offline `remote="local"` simulator does not create an NDIF job:
 
 | Status | Description |
 |--------|-------------|
@@ -1153,34 +1101,34 @@ When you run a remote trace, you'll see status updates:
 
 ### Print Statements in Remote Traces
 
-Print statements inside remote traces are captured and sent back as `LOG` status:
+On NDIF, print statements inside remote traces are captured and sent back as `LOG` status. With `REMOTE = "local"`, they print directly in your local process:
 
 ```python
-with model.trace("Hello", remote=True):
-    hidden = model.transformer.h[0].output[0]
-    print(f"Hidden shape: {hidden.shape}")  # Appears as LOG
-    print(f"Hidden mean: {hidden.mean()}")  # Appears as LOG
+with model.trace("Hello", remote=REMOTE):
+    hidden = model.transformer.h[0].output
+    print(f"Hidden shape: {hidden.shape}")  # Local stdout here; LOG on NDIF
+    print(f"Hidden mean: {hidden.mean()}")  # Local stdout here; LOG on NDIF
     output = model.lm_head.output.save()
 ```
 
 ### Saving Results Remotely
 
-**Critical:** `.save()` is how values are transmitted back to your local environment.
+**Critical:** `.save()` is how values are transmitted back from NDIF. Mutating a list created outside the trace does not return that list from the server. The offline simulator runs in your process and can mutate it, so that behavior does not demonstrate remote process isolation.
 
 ```python
-# WRONG: Local list won't be updated
+# Not portable to NDIF: an external list is only mutated by the offline run
 my_list = list()
-with model.trace("Hello", remote=True):
-    my_list.append(model.output.save())  # Local list stays empty!
+with model.trace("Hello", remote=REMOTE):
+    my_list.append(model.output.save())  # Offline: updated; live NDIF: stays empty
 
 # CORRECT: Create and save inside the trace
-with model.trace("Hello", remote=True):
+with model.trace("Hello", remote=REMOTE):
     my_list = list().save()  # Create inside trace
     my_list.append(model.output)
 
-# Best practice: move tensors to CPU for smaller downloads
-with model.trace("Hello", remote=True):
-    hidden = model.transformer.h[0].output[0].detach().cpu().save()
+# Return a detached CPU tensor for local analysis; .cpu() does not reduce its size
+with model.trace("Hello", remote=REMOTE):
+    hidden = model.transformer.h[0].output.detach().cpu().save()
 ```
 
 ### Non-Blocking Execution
@@ -1188,26 +1136,19 @@ with model.trace("Hello", remote=True):
 Submit jobs without waiting:
 
 ```python
+# Requires an NDIF deployment compatible with 0.8 and an API key.
 with model.trace("Hello", remote=True, blocking=False) as tracer:
     output = model.lm_head.output.save()
-
-# Get backend to check status
 backend = tracer.backend
-print(backend.job_id)      # UUID
-print(backend.job_status)  # JobStatus.RECEIVED
+print(backend.job_id, backend.status)
 
-# Poll for result
 import time
 while True:
-    result = backend()  # Returns None if not complete
+    result = backend()
     if result is not None:
         break
-    print(f"Status: {backend.job_status}")
     time.sleep(1)
-
-# Result is a dict with variable names as keys
-print(result.keys())        # dict_keys(['id', 'output'])
-print(result['output'].shape)
+print(result["output"].shape)
 ```
 
 ### Disable Remote Logging
@@ -1228,24 +1169,26 @@ Group multiple traces for shared state and efficiency.
 with model.session() as session:
     # First trace
     with model.trace("Hello"):
-        hs1 = model.transformer.h[0].output[0].save()
+        hs1 = model.transformer.h[0].output.save()
     
     # Second trace - can reference values from first
     with model.trace("World"):
-        model.transformer.h[0].output[0][:] = hs1
-        hs2 = model.transformer.h[0].output[0].save()
+        model.transformer.h[0].output[:] = hs1
+        hs2 = model.transformer.h[0].output.save()
 ```
 
 ### Remote Sessions
 
+This example runs as a local session. Use `remote="local"` on the session to check serialization offline, or `remote=True` on a compatible NDIF service to send the traces as one request.
+
 Sessions are especially powerful for remote execution — they bundle multiple traces into a **single request**:
 
 ```python
-# Single request, single queue wait
-with model.session(remote=True):
+# Local validation; add remote=True only on a compatible NDIF service.
+with model.session():
     # First trace: capture hidden states
     with model.trace("Megan Rapinoe plays the sport of"):
-        hs = model.model.layers[5].output[0][:, -1, :]  # No .save() needed!
+        hs = model.transformer.h[5].output[:, -1, :]  # No .save() needed!
     
     # Second trace: clean baseline
     with model.trace("Shaquille O'Neal plays the sport of"):
@@ -1253,7 +1196,7 @@ with model.session(remote=True):
     
     # Third trace: patch the hidden states
     with model.trace("Shaquille O'Neal plays the sport of"):
-        model.model.layers[5].output[0][:, -1, :] = hs  # Direct reference works!
+        model.transformer.h[5].output[:, -1, :] = hs  # Direct reference works!
         patched = model.lm_head.output[0][-1].argmax(dim=-1).save()
 
 print(f"Clean: {model.tokenizer.decode(clean)}")
@@ -1263,7 +1206,7 @@ print(f"Patched: {model.tokenizer.decode(patched)}")
 **Benefits of remote sessions:**
 - Single queue wait for all traces
 - Values from earlier traces accessible directly (no `.save()` needed)
-- Only put `remote=True` on the session, not inner traces
+- For NDIF, put `remote=True` on the session, not inner traces
 
 ---
 
@@ -1272,8 +1215,8 @@ print(f"Patched: {model.tokenizer.decode(patched)}")
 Create aliases for easier access:
 
 ```python
-model = LanguageModel(
-    "openai-community/gpt2",
+model = TransformersModel(
+    "openai-community/gpt2", task="text-generation",
     rename={
         "transformer.h": "layers",           # Mount at new path
         "mlp": "feedforward",                # Rename all MLPs
@@ -1295,13 +1238,16 @@ with model.trace("Hello"):
 
 ```python
 with model.trace() as tracer:
+    barrier = tracer.barrier(2)
     # Clean run
     with tracer.invoke("The Eiffel Tower is in"):
-        clean_hs = model.transformer.h[5].output[0][:, -1, :].save()
+        clean_hs = model.transformer.h[5].output[:, -1, :].save()
+        barrier()
     
     # Patched run
     with tracer.invoke("The Colosseum is in"):
-        model.transformer.h[5].output[0][:, -1, :] = clean_hs
+        barrier()
+        model.transformer.h[5].output[:, -1, :] = clean_hs
         patched_logits = model.lm_head.output.save()
 ```
 
@@ -1311,7 +1257,7 @@ with model.trace() as tracer:
 with model.trace("The Eiffel Tower is in"):
     # Apply final layer norm and lm_head to intermediate layers
     for i in range(12):
-        hs = model.transformer.h[i].output[0]
+        hs = model.transformer.h[i].output
         logits = model.lm_head(model.transformer.ln_f(hs))
         tokens = logits.argmax(dim=-1).save()
         print(f"Layer {i}:", model.tokenizer.decode(tokens[0][-1]))
@@ -1324,17 +1270,15 @@ with model.trace("The Eiffel Tower is in"):
 When you add auxiliary modules to a model (like SAEs or LoRA adapters), use `hook=True` to enable `.input`/`.output` access on them:
 
 ```python
-# Assume model.sae is an auxiliary SAE module you've added
+# Attach a small auxiliary module as a runnable SAE stand-in.
+model.sae = torch.nn.Identity()
 with model.trace() as tracer:
-    # First invoke: apply the SAE with hooks enabled
     with tracer.invoke("Hello"):
-        hidden = model.transformer.h[5].output[0]
-        reconstructed = model.sae(hidden, hook=True)  # Enable hooks!
-        model.transformer.h[5].output[0] = reconstructed
-    
-    # Second invoke: access the SAE's activations
+        hidden = model.transformer.h[5].output
+        reconstructed = model.sae(hidden, hook=True)
+        model.transformer.h[5].output = reconstructed
     with tracer.invoke("Hello"):
-        sae_activations = model.sae.output.save()  # Works because we used hook=True
+        sae_activations = model.sae.output.save()
 ```
 
 ### Ablation Study
@@ -1357,17 +1301,20 @@ diff = (baseline - ablated).abs().mean()
 
 ```python
 with model.trace("Hello World"):
-    # Access attention weights (model-specific)
-    attn_weights = model.transformer.h[0].attn.source.attention_interface_0.output[0].save()
+    # Eager attention exposes the probabilities after dropout.
+    attn_weights = (
+        model.transformer.h[0].attn.source.attention_interface_1
+        .source.nn_functional_dropout_0.output.save()
+    )
 ```
 
 ### Steering with Added Vectors
 
 ```python
-steering_vector = torch.randn(768)  # Pre-computed direction
+steering_vector = torch.randn(model.config.n_embd)  # Pre-computed direction
 
 with model.trace("Hello"):
-    model.transformer.h[10].output[0][:, -1, :] += steering_vector * 0.5
+    model.transformer.h[10].output[:, -1, :] += steering_vector.to(model.transformer.h[10].output) * 0.5
     output = model.lm_head.output.save()
 ```
 
@@ -1378,37 +1325,33 @@ with model.trace("Hello"):
 ### 1. Forgetting `.save()`
 
 ```python
-# WRONG - value is garbage collected
+# WRONG - binding is not exported
 with model.trace("Hello"):
-    output = model.transformer.h[-1].output[0]
+    output = model.transformer.h[-1].output
 # output is now useless
 
 # CORRECT
 with model.trace("Hello"):
-    output = model.transformer.h[-1].output[0].save()
+    output = model.transformer.h[-1].output.save()
 ```
 
 ### 2. In-Place vs Replacement
 
 ```python
-# In-place modification (modifies existing tensor)
-model.transformer.h[0].output[0][:] = 0
-
-# Replacement (creates new tensor)
-model.transformer.h[0].output[0] = torch.zeros_like(model.transformer.h[0].output[0])
+with model.trace("Hello"):
+    model.transformer.h[0].output[:] = 0
+    model.transformer.h[0].output = torch.zeros_like(model.transformer.h[0].output)
 ```
 
 ### 3. Tuple Outputs
 
 ```python
-# WRONG - trying to assign to tuple element
-model.transformer.h[0].output[0] = new_tensor  # This replaces the whole tuple!
-
-# CORRECT for in-place on first element
-model.transformer.h[0].output[0][:] = 0
-
-# CORRECT for replacing tuple element
-model.transformer.h[0].output = (new_tensor,) + model.transformer.h[0].output[1:]
+with model.trace("Hello"):
+    full_output = model.transformer.h[0].attn.output
+    # Mutate the Tensor inside the tuple.
+    full_output[0][:] = 0
+    # To replace a tuple element, construct and assign a new tuple.
+    model.transformer.h[0].attn.output = (torch.ones_like(full_output[0]),) + full_output[1:]
 ```
 
 ### 4. Clone Before In-Place Modification
@@ -1416,51 +1359,55 @@ model.transformer.h[0].output = (new_tensor,) + model.transformer.h[0].output[1:
 ```python
 # WRONG - modifying and trying to see original
 with model.trace("Hello"):
-    before = model.transformer.h[0].output[0].save()  # Points to same tensor!
-    model.transformer.h[0].output[0][:] = 0
-    after = model.transformer.h[0].output[0].save()
+    before = model.transformer.h[0].output.save()  # Points to same tensor!
+    model.transformer.h[0].output[:] = 0
+    after = model.transformer.h[0].output.save()
 # before == after because both point to modified tensor
 
 # CORRECT
 with model.trace("Hello"):
-    before = model.transformer.h[0].output[0].clone().save()
-    model.transformer.h[0].output[0][:] = 0
-    after = model.transformer.h[0].output[0].save()
+    before = model.transformer.h[0].output.clone().save()
+    model.transformer.h[0].output[:] = 0
+    after = model.transformer.h[0].output.save()
 ```
 
 ### 5. Module Access Must Be in Execution Order
 
-**Within a single invoke**, you MUST access modules in the order they execute in the forward pass. This is because each invoke is a serial thread that waits for values as the model runs forward:
+Within one invoke, read locations in the order the model reaches them. An already-passed location raises `OutOfOrderError`.
 
 ```python
-with model.trace("Hello"):
-    # CORRECT - access in execution order (layer 1 runs before layer 5)
-    out1 = model.transformer.h[1].output.save()  # Thread waits here
-    out5 = model.transformer.h[5].output.save()  # Then waits here
+from nnsight.intervention.interleaver import OutOfOrderError
 
 with model.trace("Hello"):
-    # WRONG - will deadlock! Layer 1 has already passed when you ask for it
-    out5 = model.transformer.h[5].output.save()  # Thread waits here
-    out1 = model.transformer.h[1].output.save()  # Deadlock! Layer 1 already ran
+    out1 = model.transformer.h[1].output.save()
+    out5 = model.transformer.h[5].output.save()
+
+try:
+    with model.trace("Hello"):
+        out5 = model.transformer.h[5].output.save()
+        out1 = model.transformer.h[1].output.save()
+except OutOfOrderError:
+    print("Layer 1 was already passed")
 ```
 
-**To access modules "out of order"**, use separate invokes (which are separate forward passes):
+Separate traces let you inspect locations in another order with a fresh forward pass:
 
 ```python
-with model.trace() as tracer:
-    with tracer.invoke("Hello"):
-        out5 = model.transformer.h[5].output.save()
-    
-    with tracer.invoke():  # No-arg invoke on same batch (new forward pass)
-        out1 = model.transformer.h[1].output.save()  # Works! Separate thread/pass
+with model.trace("Hello"):
+    out5 = model.transformer.h[5].output.save()
+with model.trace("Hello"):
+    out1 = model.transformer.h[1].output.save()
 ```
 
 ### 6. Trace Requires Input Without Invokes
 
 ```python
 # WRONG - no input and no invokes
-with model.trace():  # Error!
-    output = model.output.save()
+try:
+    with model.trace():
+        output = model.output.save()
+except ValueError:
+    print("Provide an input or an explicit invoke")
 
 # CORRECT - provide input
 with model.trace("Hello"):
@@ -1474,26 +1421,26 @@ with model.trace() as tracer:
 
 ### 7. Values Are Real Tensors (Not Proxies)
 
-In nnsight's thread-based architecture, when you access `.output`, your thread waits and receives the **actual tensor**:
+In nnsight's greenlet-based architecture, reading `.output` parks the worker and receives the **actual tensor**:
 
 ```python
 with model.trace("Hello"):
-    # Thread waits here and gets the REAL tensor
-    hs = model.transformer.h[0].output[0]
+    # Worker waits here and gets the REAL tensor
+    hs = model.transformer.h[0].output
     
     # This is a real shape, real operations work directly
-    shape = hs.shape  # torch.Size([1, 5, 768])
+    shape = hs.shape  # torch.Size([1, 1, 768])
     zeros = torch.zeros(shape)  # Real tensor operation
     
     # Printing works normally
-    print(shape)  # torch.Size([1, 5, 768])
+    print(shape)  # torch.Size([1, 1, 768])
 ```
 
 Use `.scan()` if you need shapes **without** running the model:
 
 ```python
 with model.scan("Hello"):
-    shape = model.transformer.h[0].output[0].shape  # Shape via fake tensors
+    shape = nnsight.save(model.transformer.h[0].output.shape)  # Export the shape
 ```
 
 ### 8. Generation vs Trace
@@ -1504,8 +1451,8 @@ with model.trace("Hello"):
     output = model.output.save()
 
 # Use .generate() for multi-token generation
-with model.generate("Hello", max_new_tokens=5):
-    output = model.generator.output.save()
+with model.generate("Hello", max_new_tokens=5, min_new_tokens=5) as tracer:
+    output = tracer.result.save()
 ```
 
 ### 9. Device Placement
@@ -1513,16 +1460,16 @@ with model.generate("Hello", max_new_tokens=5):
 ```python
 # Tensors must be on the correct device
 with model.trace("Hello"):
-    device = model.transformer.h[0].output[0].device
-    noise = torch.randn(768).to(device)  # Match device!
-    model.transformer.h[0].output[0][:, -1, :] += noise
+    device = model.transformer.h[0].output.device
+    noise = torch.randn(model.config.n_embd).to(device)  # Match device!
+    model.transformer.h[0].output[:, -1, :] += noise
 ```
 
 ---
 
 ## Understanding Exceptions in NNsight
 
-Debugging in NNsight can be tricky because of **deferred execution**. Your intervention code is captured, compiled into a function, and run in a worker thread — not where you wrote it. Without special handling, exceptions would point to internal NNsight code instead of your original trace.
+Debugging in NNsight can be tricky because of **deferred execution**. Your intervention code is captured, compiled into a function, and run in a worker greenlet — not where you wrote it. Without special handling, exceptions would point to internal NNsight code instead of your original trace.
 
 ### How NNsight Fixes This
 
@@ -1537,21 +1484,21 @@ NNsight **reconstructs exception tracebacks** to show your original code and lin
 Traceback (most recent call last):
   File "my_experiment.py", line 6, in <module>
     hidden = model.transformer.h[100].output.save()
-IndexError: list index out of range
+AttributeError: invalid module index 100
 ```
 
-This points directly to your code, even though it actually ran in a compiled worker thread.
+This points directly to your code, even though it actually ran in a compiled worker greenlet.
 
 ### Exception Type Preservation
 
-NNsight preserves the original exception type, so you can still catch specific exceptions:
+In local traces, NNsight preserves the original exception type, so you can catch specific exceptions. Deferred worker errors crossing a process boundary, such as vLLM engine errors, can instead arrive as `RuntimeError` with the original type name and traceback:
 
 ```python
 try:
     with model.trace("Hello"):
         hidden = model.transformer.h[100].output.save()
-except IndexError:
-    print("Caught the IndexError!")  # This works!
+except (IndexError, AttributeError):
+    print("Caught the invalid module index!")  # This works!
 ```
 
 ### DEBUG Mode
@@ -1571,14 +1518,15 @@ This shows internal NNsight frames, which can help:
 
 | Exception | Cause | Fix |
 |-----------|-------|-----|
-| `OutOfOrderError: Value was missed for model.layer.output.i0` | Accessed modules in wrong order within an invoke | Access modules in forward-pass order |
-| `ValueError: Execution complete but ... was not provided` | Mediator still waiting - module never called or gradient order wrong | Check module path exists; access gradients in reverse order |
-| `ValueError: Cannot return output of Envoy that is not interleaving` | Trace has no input, model never ran | Provide input to `.trace(input)` or use `.invoke()` |
-| `ValueError: Cannot invoke during an active model execution` | Tried to create invoke inside another invoke | Use sequential, non-nested invokes |
-| `ValueError: Cannot request ... in a backwards tracer` | Accessed `.output`/`.input` inside `backward()` instead of `.grad` | Define tensors before backward, access `.grad` inside |
+| `OutOfOrderError: ... was requested but the model already ran past it` | Accessed modules in wrong order within an invoke | Access modules in forward-pass order |
+| `OutOfOrderError` | Mediator still waiting - module never called or gradient order wrong | Check module path exists; access gradients in reverse order |
+| `ValueError: trace() needs an input, or at least one ... block` | Trace has no input or invokes | Provide input to `.trace(input)` or use `.invoke()` |
+| `ValueError: Cannot access ... outside of interleaving` | Activation read outside an intervention worker | Read inside a trace/invoke and save the result |
+| `ValueError: Cannot invoke while the model is already running` | Tried to create invoke inside another invoke | Use sequential, non-nested invokes |
+| `OutOfOrderError` | Requested a forward activation during a backward session | Capture tensors before backward, access their `.grad` inside |
 | `AttributeError: ... has no attribute X` | Nonexistent module accessed | Use `print(model)` to see available modules |
-| `AttributeError: Tokenizer not found` | Wrapped pre-loaded model without providing tokenizer | Provide `tokenizer=` when wrapping pre-loaded models |
-| `NotImplementedError: Batching not implemented` | Multiple invokes on base `NNsight` | Use `LanguageModel` for multiple invokes, or single invoke |
+| Tokenizer loading error | Pre-loaded model has no usable checkpoint name or tokenizer | Provide `tokenizer=` when wrapping |
+| `NotImplementedError: ... does not support batching multiple invokes` | Base wrapper cannot combine multiple invokes | Use a batching-capable wrapper or override `_batch(invokes, fn)` |
 
 **The `.i0` suffix** in error messages indicates iteration 0 (first call). In generation, you'd see `.i1`, `.i2`, etc.
 
@@ -1594,7 +1542,7 @@ Print works normally inside traces:
 
 ```python
 with model.trace("Hello"):
-    out = model.transformer.h[0].output[0]
+    out = model.transformer.h[0].output
     print("Shape:", out.shape)
     print("Mean:", out.mean())
 ```
@@ -1607,12 +1555,15 @@ with model.trace("Hello"):
     breakpoint()  # Drops into pdb
 ```
 
-### 2. Enable Scan and Validate
+### 2. Validate with Scan
 
 ```python
-with model.trace("Hello", scan=True, validate=True):
-    # Errors will be caught with fake tensors before real execution
-    model.transformer.h[0].output[0][:, 1000] = 0  # Will fail early if dim < 1001
+# Expected failure: "Hello" has fewer than 1001 token positions.
+try:
+    with model.scan("Hello"):
+        model.transformer.h[0].output[:, 1000] = 0
+except IndexError:
+    print("Invalid sequence-position index caught during scan")
 ```
 
 ### 3. Check Module Structure
@@ -1631,7 +1582,7 @@ Use `.scan()` to get shapes without running the full model:
 
 ```python
 with model.scan("Hello"):
-    print(model.transformer.h[0].output[0].shape)  # (1, seq_len, hidden_dim)
+    print(model.transformer.h[0].output.shape)  # (1, seq_len, hidden_dim)
     print(model.lm_head.output.shape)  # (1, seq_len, vocab_size)
 ```
 
@@ -1653,41 +1604,35 @@ NNsight has several configuration options accessible via `nnsight.CONFIG`:
 
 ```python
 from nnsight import CONFIG
-
-# Debug mode - more verbose error messages
 CONFIG.APP.DEBUG = True
-
-# Cross-invoker variable sharing (default: True)
-# When True, variables from one invoke can be accessed in another
-# When False, each invoke is isolated (useful for debugging)
-CONFIG.APP.CROSS_INVOKER = True
-
-# Pymount - enables obj.save() on base Python objects (default: True)
-# Uses C extension to add .save() method to base object class
-# Set to False if you prefer nnsight.save() exclusively
+CONFIG.APP.REMOTE_LOGGING = True
 CONFIG.APP.PYMOUNT = True
-
-# Save config changes
+# Linux/x86-64 guard for torch C++ exceptions in greenlets.
+CONFIG.APP.DISABLE_CPP_BACKTRACE = True
 CONFIG.save()
 ```
 
 ### Cross-Invoker Variable Sharing
 
-By default, variables from one invoke can be used in another (because invokes run serially):
+Variables from sibling invokes share a captured scope. Because workers resume at model locations rather than running one whole invoke at a time, synchronize value dependencies with a barrier:
 
 ```python
 with model.trace() as tracer:
+    barrier = tracer.barrier(2)
     with tracer.invoke("Hello"):
         embeddings = model.transformer.wte.output  # Captured here
+        barrier()
     
     with tracer.invoke("World"):
-        model.transformer.wte.output = embeddings  # Used here (works because CROSS_INVOKER=True)
+        barrier()
+        model.transformer.wte.output = embeddings  # Used here (shared after the barrier)
 ```
 
-If you're debugging and want to ensure invokes are isolated:
+The old configuration switch was removed:
 
 ```python
-CONFIG.APP.CROSS_INVOKER = False  # Now cross-invoke references will error
+# Sharing uses the captured Scope in 0.8; there is no CROSS_INVOKER setting.
+assert "CROSS_INVOKER" not in CONFIG.APP.model_fields
 ```
 
 ### Barrier Synchronization
@@ -1709,7 +1654,7 @@ with llm.trace() as tracer:
         patched_output = llm.lm_head.output[:, -1].save()
 ```
 
-Without the barrier, the second invoke would fail with `paris_embeddings is not defined` because both invokes access `wte.output` and invokes normally run serially.
+Without the barrier, the second invoke would fail with `paris_embeddings is not defined` because the consuming worker may read the shared name before the producer has received its activation.
 
 ### Re-wrapping the Same Model
 
@@ -1754,7 +1699,7 @@ model2 = NNsight(my_pytorch_model)  # Safe - hooks replaced, not duplicated
 | `.input` | First positional input |
 | `.inputs` | All inputs `(args, kwargs)` |
 | `.source` | Internal operation tracing |
-| `.next()` | Advance to next generation step |
+| `.next()` | Removed in 0.8; select steps with `tracer.iter` |
 | `.skip(value)` | Skip module with given output |
 
 
@@ -1762,9 +1707,64 @@ model2 = NNsight(my_pytorch_model)  # Safe - hooks replaced, not duplicated
 
 ---
 
+## Other NNsight 0.8 Features
+
+### Pipelines Beyond Causal Language Models
+
+`TransformersModel` supports any task the HuggingFace pipeline factory can build, including fill-mask, classification, image-text-to-text, and speech recognition. Preprocessing is task-specific. This small public checkpoint demonstrates fill-mask without downloading a large model:
+
+```python
+masked_model = TransformersModel(
+    "hf-internal-testing/tiny-random-BertForMaskedLM",
+    task="fill-mask", dispatch=True,
+)
+with masked_model.pipe("The capital of France is [MASK].", top_k=2) as tracer:
+    records = tracer.result.save()
+assert len(records) == 2
+```
+
+### Generate Versus Pipe
+
+`generate()` returns token IDs for causal language models; `pipe()` returns task pipeline records, such as decoded text or labels:
+
+```python
+with model.generate("Hello", max_new_tokens=2, min_new_tokens=2, do_sample=False) as tracer:
+    token_ids = tracer.result.save()
+with model.pipe("Hello", max_new_tokens=2, min_new_tokens=2, do_sample=False) as tracer:
+    records = tracer.result.save()
+assert "generated_text" in records[0]
+```
+
+### Diffusion Pipelines
+
+Install `diffusers` separately. `DiffusionModel` wraps UNet- and transformer-based pipelines, supports per-invoke batching, accepts `seed=`, and exposes denoising iterations. `automodel=` selects the loading class. The tiny checkpoint below tests the API; its images are not representative of a trained production model.
+
+```python
+from nnsight import DiffusionModel
+
+diffusion = DiffusionModel("hf-internal-testing/tiny-stable-diffusion-torch", safety_checker=None)
+with diffusion.generate("a cat", num_inference_steps=2, seed=0) as tracer:
+    noise_predictions = nnsight.save([])
+    for step in tracer.iter[:2]:
+        noise_predictions.append(diffusion.unet.output[0].clone())
+    images = tracer.result.save()
+assert len(noise_predictions) == 2
+assert len(images.images) == 1
+```
+
+### Large-Model Loading
+
+- **Quantization:** `dtype="nf4"` and the other supported quantization names select loader configurations. Bitsandbytes formats require `bitsandbytes` and `accelerate`, plus supported hardware. See [quantization](https://github.com/ndif-team/nnsight/blob/main/docs/models/quantization.md).
+- **Tensor parallelism:** Transformers models support `distributed_config=DistributedConfig(tp_size=N)` under `torchrun`, with sharded activations gathered for the trace. This is distinct from `device_map="auto"` layer placement and requires multiple supported GPUs. See [tensor parallelism](https://github.com/ndif-team/nnsight/blob/main/docs/models/tensor-parallel.md).
+- **PEFT:** `TransformersModel(..., peft=adapter_repo_id)` applies adapters at load time; the remote environment can carry per-request adapters. Install `peft` for this optional feature.
+- **Custom hookable values:** `@eproperty` is the public descriptor behind `.input`, `.output`, and `tracer.result`; `envoys=` mounts custom Envoy classes by module type or path suffix. See the runnable examples in [NNsight.md](NNsight.md#10-extending-nnsight).
+- **Remote tooling:** `nnsight login` stores and verifies an NDIF key; `nnsight.status()`, `nnsight.compare()`, and `nnsight.register(module)` support service inspection, environment comparison, and shipping local code by value. Live requests require a service compatible with the client.
+
+---
+
 ## Version Notes
 
-This guide is written for **nnsight v0.5+**. Key changes from earlier versions:
+This guide is verified against **nnsight 0.8.0rc1** and **transformers 5.x**. Key changes from earlier versions:
 
 - Standard Python `if`/`for` statements now work inside tracing contexts (replaces `nnsight.cond()`, `session.iter()`)
 - `nnsight.apply()` is deprecated - use functions directly
@@ -1781,15 +1781,16 @@ nnsight/
 │   ├── __init__.py          # Main exports
 │   ├── modeling/
 │   │   ├── base.py          # NNsight class
-│   │   ├── language.py      # LanguageModel class
+│   │   ├── transformers.py  # TransformersModel and pipeline integration
 │   │   └── vllm/            # vLLM integration
 │   └── intervention/
 │       ├── envoy.py         # Core Envoy wrapper
 │       ├── interleaver.py   # Execution interleaving
-│       └── tracing/         # Tracer implementations
+│       ├── tracer.py        # Intervention tracing
+│       └── eproperty.py     # Hookable value descriptors
 └── tests/
     ├── test_tiny.py         # Basic NNsight tests
-    ├── test_lm.py           # LanguageModel tests
+    ├── test_lm.py           # TransformersModel tests
     └── test_vllm.py         # vLLM tests
 ```
 

@@ -8,7 +8,10 @@ The purpose of this document is to define the expectations for executing and sub
 - State "I'm claiming (paper title)" in your channel, then woog will mark it on the spreadsheet. If two people attempt to claim the same one, it goes to who claimed first.
 
 ## Compute and tooling
-- You must use [nnterp](https://github.com/ndif-team/nnterp) to perform all experiments. Comes bundled with [nnsight](https://github.com/ndif-team/nnsight)
+
+NNsight 0.8.0rc1 is the current prerelease. Use `TransformersModel` and the 0.8 examples in [llms.md](llms.md). During the prerelease, NDIF remains on 0.7: test 0.8 locally or with `remote="local"` and declare the temporary remote-validation limitation. Resume live NDIF validation when the service supports 0.8.
+
+- You must use [nnterp](https://github.com/ndif-team/nnterp) to perform all experiments. For NNsight 0.8, the released nnterp 1.2/1.3 requires the [course compatibility adapter](arena-ch1/nnterp_compat.py); import `StandardizedTransformer` through that adapter. Install the course requirements for nnterp experiments. For direct NNsight experiments: `pip install nnsight==0.8.0rc1 accelerate`
 - You must sign up for an NDIF api key here: https://login.ndif.us/
 - Preferably you sign up using a gmail account
 - Under user profile, if you have nothing original to say enter these defaults:
